@@ -1,0 +1,41 @@
+[package]
+name = "Norm_Net"
+version = "0.1.0"
+authors = ["Corallus-Caninus <ward.joshua92@yahoo.com>"]
+edition = "2021"
+
+[profile.release]
+lto=true
+incremental=true
+opt-level=3
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "Norm_net"
+path = "src/lib.rs"
+
+[dependencies]
+enclose = "1.1.8"
+# uinput = "0.1.3"
+toml = "0.5.8"
+serde_derive = "1.0.130"
+serde = "1.0.130"
+tensorflow = {version = "0.17.0", features = ["tensorflow_gpu"]}
+rand = "0.8.4"
+half = "1.7.1"
+# windows = { version = "0.26.0", features = ["UI_Input_Preview_Injection", "Foundation_Collections", "build", "std"] }
+# windows_macros = "0.28.0"
+# winapi = "0.3.9"
+# once_cell = "1.8.0"
+# inputbot = "0.5.1"
+# inputbot = { git = "https://github.com/Corallus-Caninus/inputbot.git" }
+
+# [dependencies.windows]
+# version = "0.28.0"
+# features = ["alloc", "Data_Xml_Dom", "Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "UI_Input_Preview_Injection", "Foundation_Collections", "Foundation_Numerics", "Win32_UI_Input_KeyboardAndMouse",
+# ]
+
+# [dependencies.windows-sys]
+# version = "0.28.0"
+# features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Foundation", "Foundation_Collections",
+# ]
