@@ -8,6 +8,7 @@
 // #![feature(int_log)]
 use half::bf16;
 use half::f16;
+use std::cell::RefCell;
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -27,6 +28,7 @@ use tensorflow::Operation;
 use tensorflow::Output;
 use tensorflow::OutputName;
 use tensorflow::SavedModelBundle;
+use tensorflow::SavedModelSaver;
 use tensorflow::Scope;
 use tensorflow::Session;
 use tensorflow::SessionOptions;
@@ -331,236 +333,44 @@ pub fn norm_net(
     Ok((net_layers, net_vars, input, label, scope))
 }
 
-///construct a graph scope for building, trainning and evaluating an ANN.
-fn test_train<P: AsRef<Path>>(save_dir: P) -> Result<(), Box<dyn Error>> {
-    // ================
-    // Build the model.
-    // ================
-    let mut scope = Scope::new_root_scope();
-    let scope = &mut scope;
-
-    //construct a norm_net with scope
-    let (layers, variables, input, label, scope) = norm_net(scope, 2, 1, 10, 5, 100)?;
-    let output = layers.last().unwrap().to_owned();
-
-    //TODO: REFACTOR into method (begin builder)
-    //pythagorean distance for error because outputs can be negative
-    let error = ops::sqrt(
-        ops::pow(
-            ops::sub(output.clone(), label.clone(), scope)?,
-            ops::constant(2.0 as f32, scope)?,
-            scope,
-        )?,
-        scope,
-    )?;
-    // let error = ops::sqrt(error, scope)?;
-    let error = ops::pow(error.clone(), ops::constant(2.0 as f32, scope)?, scope)?;
-
-    //TODO: NEED MOMENTUM
-    // let optimizer =
-    // GradientDescentOptimizer::new(ops::constant(0.01f32, scope).unwrap());
-    //TODO: there should be a way to treat oscillations (thrashing between set of local minima)
-    //      and local minima with momentum now that bias is gone
-    let mut optimizer = AdadeltaOptimizer::new();
-    optimizer.set_epsilon(ops::constant(1e-5 as f32, scope)?);
-    optimizer.set_rho(ops::constant(0.95 as f32, scope)?);
-    optimizer.set_learning_rate(ops::constant(0.001 as f32, scope)?);
-
-    let (minimizer_vars, minimize) = optimizer
-        .minimize(
-            scope,
-            error.clone().into(),
-            MinimizeOptions::default().with_variables(&variables),
-        )?
-        .into();
-
-    //TODO: extract into a method
-    // ===================
-    // Saved Model Builder
-    // ===================
-    let mut all_vars = variables.clone();
-    all_vars.extend_from_slice(&minimizer_vars);
-    let mut builder = tensorflow::SavedModelBuilder::new();
-    builder
-        .add_collection("train", &all_vars)
-        .add_tag("serve")
-        .add_tag("train")
-        .add_signature(REGRESS_METHOD_NAME, {
-            let mut def = SignatureDef::new(REGRESS_METHOD_NAME.to_string());
-            def.add_input_info(
-                REGRESS_INPUTS.to_string(),
-                TensorInfo::new(
-                    DataType::Float,
-                    Shape::from(None),
-                    OutputName {
-                        name: input.name()?,
-                        //TODO: what is this index in terms of the output tensor?
-                        index: 0,
-                    },
-                ),
-            );
-            def.add_output_info(
-                REGRESS_OUTPUTS.to_string(),
-                TensorInfo::new(DataType::Float, Shape::from(None), output.name()?),
-            );
-            def
-        });
-    let saved_model_saver = builder.inject(scope)?;
-
-    //TODO: seperate this from construction in case of towers etc.
-    //      pass in a scope and return a scope.
-
-    // =========================
-    // Initialize the variables.
-    // =========================
-    let options = SessionOptions::new();
-    let g = scope.graph_mut();
-    let session = Session::new(&options, &g)?;
-    let mut run_args = SessionRunArgs::new();
-    // Initialize variables we defined.
-    for var in &variables {
-        run_args.add_target(&var.initializer());
-    }
-    // Initialize variables the optimizer defined.
-    for var in &minimizer_vars {
-        run_args.add_target(&var.initializer());
-    }
-    session.run(&mut run_args)?;
-    //TODO: END REFACTOR
-    // pass in train functionally
-
-    // ================
-    // Train the model.
-    // ================
-    let mut input_tensor = Tensor::new(&[1, 2]);
-    let mut label_tensor = Tensor::new(&[1, 1]);
-    // the trainning routine
-    // TODO: pass this in as a lambda for virtual interface
-    let mut train = |i| -> Result<Tensor<f32>, Box<dyn Error>> {
-        //generate a random number between -1 and 1 for input tensor
-        //regress on multiplication surface for -1 > x > 1
-        let mut rrng = rand::thread_rng();
-
-        // //NOTE: I ran out of trivial test cases to run so I did all of them
-        //MOD
-        // let c = rrng.gen_range(-1.0..1.0);
-        // let d = rrng.gen_range(-1.0..1.0);
-        // input_tensor[2] = f16::from_f32(c);
-        // input_tensor[3] = f16::from_f32(d);
-        // label_tensor[1] = f16::from_f32(c % d);
-
-        //XOR
-        input_tensor[0] = ((i & 1) as f32);
-        input_tensor[1] = (((i >> 1) & 1) as f32);
-        label_tensor[0] = (((i & 1) ^ ((i >> 1) & 1)) as f32);
-
-        //DIV
-        // let a = rrng.gen_range(-1.0..1.0);
-        // let b = rrng.gen_range(-1.0..1.0);
-        // input_tensor[0] = a as f32;
-        // input_tensor[1] = b as f32;
-
-        // label_tensor[0] = (a / b) as f32;
-
-        let mut run_args = SessionRunArgs::new();
-        //print the output of layer5
-        // run_args.add_target(&layer1_output);
-        run_args.add_target(&minimize);
-        let error_squared_fetch = run_args.request_fetch(&error, 0);
-        // let layer5_output_fetch = run_args.request_fetch(&layer1_output, 0);
-        run_args.add_feed(&input, 0, &input_tensor);
-        run_args.add_feed(&label, 0, &label_tensor);
-        session.run(&mut run_args)?;
-        //print layer5 output
-        if i % 1000 == 0 {
-            println!("\n ----SIGNALS----\n");
-            // println!("{}", run_args.fetch::<f16>(layer5_output_fetch)?);
-            println!("\n\n");
-        }
-        Ok(run_args.fetch(error_squared_fetch)?)
-    };
-
-    let mut j: usize = 0;
-    let mut i = 0;
-    loop {
-        if j == 1000000 {
-            // if j == 10000{
-            break;
-        }
-        j = j + 1;
-        if i == i32::max_value() {
-            i = 0;
-        } else {
-            i = i + 1;
-        }
-        // for i in 0..10000 {
-        // if j % 10 == 0 {
-        //print 4 iterations
-        println!("{} with {}", j, train(i)?);
-        println!("{} with {}", j, train(i + 1)?);
-        println!("{} with {}", j, train(i + 2)?);
-        println!("{} with {}", j, train(i + 3)?);
-        println!("");
-        // } else {
-        //     train(i)?;
-        // }
-    }
-
-    // ================
-    // Save the model.
-    // ================
-    // saved_model_saver.save(&session, &g, &save_dir)?;
-
-    // ===================
-    // Evaluate the model.
-    // ===================
-    // for i in 0..4 {
-    //     let error = train(i)?;
-    //     println!("Error: {}", error);
-    //     if error > 0.1 {
-    //         return Err(Box::new(Status::new_set(
-    //             Code::Internal,
-    //             &format!("Error too high: {}", error),
-    //         )?));
-    //     }
-    // }
-    //TODO: print the connection weights for each layer
-    // ================
-    // Print the connection weights.
-    // ================
-    // println!("{}", run_args.fetch::<f32>(value)?[0]);
-
-    Ok(())
-}
-
-// BEGIN CLASS REWORK
-//TODO: deprecate the above functional code once the stateful code is feature complete and tested
 //TODO: save and load from disk
+//TODO: does save/load require UUID? allow user to name in initialization for organization?
+//TODO: defaults such as learning rate
 /// a Normalizing Network currently being researched
 /// NOTE: currently inputs and outputs must be flattened if representing >1 dim data
 struct NormNet<'a> {
+    ///he scope for tensorflow to prevent having multiple scopes active
     scope: &'a mut Scope,
+    ///Session options currently being used
+    session: Option<Session>,
     session_options: SessionOptions,
+    graph: Option<Graph>,
+    ///each layers output hook of the network
     net_layers: Vec<Output>,
+    ///all the parameters of the network
     net_vars: Vec<Variable>,
+    //TODO: these may need to be refcell as well for saved model loader
     Input: Operation,
     Label: Operation,
     Output: Output,
+    Error: Operation,
+    optimizer: AdadeltaOptimizer,
+    minimize_vars: Vec<Variable>,
+    minimize: Operation,
+    SavedModelSaver: RefCell<Option<SavedModelSaver>>,
 }
 impl<'a> NormNet<'a> {
-    fn new(
+    pub fn new(
         scope: &'a mut Scope,
         input_size: u64,
         output_size: u64,
         layer_width: u64,
         layer_height: u64,
         max_integer: u32,
+        learning_rate: f32,
+        //a power to raise the pythagorean distance error to for gradient scaling error_
+        error_power: f32,
     ) -> Result<NormNet, Status> {
-        // create a norm net with norm_net function above
-        // create a scope
-        //TODO: can this operate with other TF scopes external to NormNet?
-        //      does this overallocate and prevent xla optimizations?
-        // let mut scope = Scope::new_root_scope();
         // TODO: consider inlining this since were encapsulating
         let Input = ops::Placeholder::new()
             .dtype(DataType::Float)
@@ -612,7 +422,6 @@ impl<'a> NormNet<'a> {
             &|x, scope| {
                 Ok(ops::multiply(
                     ops::tanh(x, scope)?,
-                    //TODO: extract this scalar coefficient
                     ops::constant(max_integer as f32, scope)?,
                     scope,
                 )?
@@ -624,186 +433,287 @@ impl<'a> NormNet<'a> {
         net_layers.push(output);
         //END OF CONSTRUCTING NETWORK
 
-        let Output = net_layers.last().unwrap().clone();
+        let Output = net_layers.last().unwrap().to_owned();
 
         let options = SessionOptions::new();
+        let init_saved_model_saver = RefCell::new(None);
 
-        //TODO: sort these
+        //TODO: this needs to be in state so that it can be saved for transfer learning
+        let mut optimizer = AdadeltaOptimizer::new();
+        optimizer.set_learning_rate(ops::constant(learning_rate, scope)?);
+
+        // DEFINE ERROR FUNCTION //
+        //TODO: pass this in conditionally, give user output and label with
+        //      a partial constructor then they supply error and construction is complete
+        // two structs? whats standard functionally for partial construction?
+        //default error is pythagorean distance
+        let Error = ops::sqrt(
+            ops::pow(
+                ops::sub(Output.clone(), Label.clone(), scope)?,
+                ops::constant(2.0 as f32, scope)?,
+                scope,
+            )?,
+            scope,
+        )?;
+        //TODO: at least pass in the constant here as a gradient weighting scalar coefficient
+        let Error = ops::pow(
+            Error.clone(),
+            ops::constant(error_power, scope).unwrap(),
+            scope,
+        )
+        .unwrap();
+
+        let (minimize_vars, minimize) = optimizer
+            .minimize(
+                scope,
+                Error.clone().into(),
+                MinimizeOptions::default().with_variables(&net_vars),
+            )?
+            .into();
+
+        // let mut run_args = SessionRunArgs::new();
+
         Ok(NormNet {
+            scope,
+            session: None,
+            session_options: options,
+            graph: None,
             net_layers,
             net_vars,
             Input,
             Label,
             Output,
-            scope,
-            session_options: options,
+            Error,
+            optimizer,
+            minimize_vars,
+            minimize,
+            SavedModelSaver: init_saved_model_saver,
         })
     }
-    ///train the network with the given inputs and labels (must be synchronized in index order)
+    // forward pass and return result
+    // fn infer
+    //one time traning that can take output of infer and a label
+    // fn backprop
+    //save the model out to disk in this directory as default
+    pub fn save(self) -> Result<(), Box<dyn Error>> {
+        // save the model to disk in the current directory
+        if self.SavedModelSaver.borrow().is_none() {
+            println!("initializing saved model saver..");
+            let mut all_vars = self.net_vars.clone();
+            all_vars.extend_from_slice(&self.minimize_vars);
+            let mut builder = tensorflow::SavedModelBuilder::new();
+            builder
+                .add_collection("train", &all_vars)
+                .add_tag("serve")
+                .add_tag("train")
+                .add_signature(REGRESS_METHOD_NAME, {
+                    let mut def = SignatureDef::new(REGRESS_METHOD_NAME.to_string());
+                    def.add_input_info(
+                        REGRESS_INPUTS.to_string(),
+                        TensorInfo::new(
+                            DataType::Float,
+                            Shape::from(None),
+                            OutputName {
+                                name: self.Input.name()?,
+                                index: 0,
+                            },
+                        ),
+                    );
+                    def.add_output_info(
+                        REGRESS_OUTPUTS.to_string(),
+                        TensorInfo::new(DataType::Float, Shape::from(None), self.Output.name()?),
+                    );
+                    //add error
+                    // def.add_output_info(
+                    //     "error".to_string(),
+                    //     TensorInfo::new(DataType::Float, Shape::from(None), Error.name()),
+                    // );
+                    //add label
+                    // def.add_output_info(
+                    //     "label".to_string(),
+                    //     TensorInfo::new(DataType::Float, Shape::from(None), "Label"),
+                    // );
+                    def
+                });
+            let saved_model_saver = builder.inject(self.scope)?;
+            self.SavedModelSaver.replace(Some(saved_model_saver));
+        }
+        // self.SavedModelSaver.borrow_mut().as_mut().unwrap().save();
+        // same as above  but pass savedmodelsaver session graph and save directory
+        self.SavedModelSaver.borrow_mut().as_mut().unwrap().save(
+            &self.session.unwrap(),
+            &self.graph.unwrap(),
+            "./",
+        )?;
+        Ok(())
+    }
+
+    //TODO: load
+    // pub fn load(self) {
+    //     // load the model from disk in the current directory
+    //     println!("loading previously saved model..");
+    //     //TODO: check examples in tensorflow rust for solution:
+    //     // load the model from the saved model saver for this training session
+    //     let save_dir = std::env::current_dir().unwrap();
+    //     let mut graph = Graph::new();
+    //     let bundle = SavedModelBundle::load(
+    //         //TODO: test here that this overwrites correctly
+    //         // &SessionOptions::new(),
+    //         &self.session_options,
+    //         &["serve", "train"],
+    //         &mut graph,
+    //         save_dir,
+    //     )?;
+    //     //TODO: associate the operations with the class state
+    //     let session = &bundle.session;
+    //     let signature = bundle.meta_graph_def().get_signature(REGRESS_METHOD_NAME)?;
+    //     let input_info = signature.get_input(REGRESS_INPUTS)?;
+    //     let output_info = signature.get_output(REGRESS_OUTPUTS)?;
+    //     let error_info = signature.get_output("error")?;
+    //     //TODO: test
+    //     // let label_info = signature.get_output("label")?;
+    //     //TODO: associate the operations with the class state
+    //     //TODO: get variables from collection and associate with the class state, this should be all that is actually needed however.
+    //     let input = graph.operation_by_name_required(&input_info.name().name)?;
+    //     let output = graph.operation_by_name_required(&output_info.name().name)?;
+    //     let error = graph.operation_by_name_required(&self.Error.name()?)?;
+    //     // let label = graph.operation_by_name_required(&label_info.name().name)?;
+    // }
+
+    /// train the network with the given inputs and labels (must be synchronized in index order)
+    /// initializes a saved model saver if not already initialized and saves after trainning.
     ///PARAMETERS:
     /// inputs: the inputs to the network as a flattened 1D vector
     /// labels: the labels for the inputs as a flattened 1D vector, must align index wise with inputs. (e.g. inputs[0] must be labeled as labels[0])
     /// error: the error operation to minimize with (e.g. pythagorean error sqrt(x^2 + y^2))
     /// learning_rate: the learning rate for the network (e.g. 0.001)
-    fn train<T: tensorflow::TensorType>(
+    pub fn train<T: tensorflow::TensorType>(
         // &mut self,
         self,
-        inputs: Vec<&[T]>,
-        labels: Vec<&[T]>,
-        error: Operation,
-        learning_rate: f32,
+        inputs: Vec<Vec<T>>,
+        labels: Vec<Vec<T>>,
+        // TODO: pass these is instead of constructing
+        // error: Operation,
+        // learning_rate: f32,
     ) -> Result<Vec<Tensor<f32>>, Status> {
-        let mut optimizer = AdadeltaOptimizer::new();
-        optimizer.set_learning_rate(ops::constant(learning_rate, self.scope)?);
-
-        let (minimize_vars, minimize) = optimizer
-            .minimize(
-                self.scope,
-                error.clone().into(),
-                // MinimizeOptions::default().with_variables(&net.1),
-                MinimizeOptions::default().with_variables(&self.net_vars),
-            )?
-            .into();
+        //TODO: allow to change learning rate and error here
+        // load the model if it has been saved otherwise initialize a saved model saver
+        //TODO: extract this so we can call it in other training methods as a "refresh" serialization synchronization
+        // TODO: also a sub method for save() and load()
 
         let g = self.scope.graph_mut();
         let session = Session::new(&self.session_options, &g)?;
+        let mut run_args = SessionRunArgs::new();
+
+        // set parameters to be optimization targets
+        for var in &self.net_vars {
+            run_args.add_target(&var.initializer());
+        }
+        for var in &self.minimize_vars {
+            run_args.add_target(&var.initializer());
+        }
+        session.run(&mut run_args)?;
 
         //TODO: shouldnt need to initialize so much ITL
         //TODO: randomize input and labels and k-fold
         //TODO: create dataset structure
+        println!("trainning..");
         let mut result = vec![];
 
         let mut input_tensor: Tensor<T> = Tensor::new(&[1u64, inputs[0].len() as u64]);
         // print inputs[0].len();
+        println!("inputs.len(): {}", inputs.len());
         println!("{}", inputs[0].len());
         let mut label_tensor: Tensor<T> = Tensor::new(&[1u64, labels[0].len() as u64]);
         println!("{}", labels[0].len());
         // let layer5_output_fetch = run_args.request_fetch(&layer1_output, 0);
-        for (input, label) in inputs.clone().into_iter().zip(labels.clone().into_iter()) {
-            println!("{:?}", input);
-            println!("{:?}", label);
+        let mut input_iter = inputs.into_iter();
+        let mut label_iter = labels.into_iter();
+        input_iter.next();
+        label_iter.next();
+        let mut i = 0;
+        loop {
+            i += 1;
+            let input = input_iter.next();
+            let label = label_iter.next();
+            if input.is_none() || label.is_none() {
+                break;
+            }
+            let input = input.unwrap();
+            let label = label.unwrap();
+            // now get input and label as slices
+            let input = input.as_slice();
+            let label = label.as_slice();
+            // now assign the input and label to the tensor
+            for i in 0..input.len() {
+                input_tensor[i] = input[i].clone();
+            }
+            for i in 0..label.len() {
+                label_tensor[i] = label[i].clone();
+            }
+
             let mut run_args = SessionRunArgs::new();
-            for var in &self.net_vars {
-                run_args.add_target(&var.initializer());
-            }
-            for var in &minimize_vars {
-                run_args.add_target(&var.initializer());
-            }
-            run_args.add_target(&minimize);
-            // session.run(&mut run_args)?;
+            run_args.add_target(&self.minimize);
 
-            let error_squared_fetch = run_args.request_fetch(&error, 0);
-            // load input into input tensor
-            //TODO: pop off each input and label
-            input
-                .iter()
-                .enumerate()
-                .for_each(|x| input_tensor[x.0] = x.1.clone());
-            label
-                .iter()
-                .enumerate()
-                .for_each(|x| label_tensor[x.0] = x.1.clone());
-            println!("input shape: {:?}", input_tensor.shape());
-            println!("label shape: {:?}", label_tensor.shape());
-
-            // let res = run_args.fetch(error_squared_fetch)?;
-            let error_squared_fetch = run_args.request_fetch(&error, 0);
+            let error_squared_fetch = run_args.request_fetch(&self.Error, 0);
             run_args.add_feed(&self.Input, 0, &input_tensor);
             run_args.add_feed(&self.Label, 0, &label_tensor);
             session.run(&mut run_args)?;
 
-            // result.push(run_args.fetch(error_squared_fetch)?);
-            result.push(run_args.fetch(error_squared_fetch)?);
+            let res: Tensor<f32> = run_args.fetch(error_squared_fetch)?;
+            // do the above prints in one line
+            println!(
+                "training on {}\n input: {:?} label: {:?} error: {}",
+                i, input, label, res
+            );
+
+            result.push(res);
         }
+
+        //TODO: save the model
         Ok(result)
-        //print layer5 output
-        // if i % 1000 == 0 {
-        //     println!("\n ----SIGNALS----\n");
-        //     // println!("{}", run_args.fetch::<f16>(layer5_output_fetch)?);
-        //     println!("\n\n");
-        // }
-        // let error = run_args.fetch(error_squared_fetch)?;
     }
 }
-// END OF CLASS REWORK
 
-fn eval<P: AsRef<Path>>(save_dir: P) -> Result<(), Box<dyn Error>> {
-    //load the graph
-    let mut graph = Graph::new();
-    let bundle = SavedModelBundle::load(
-        &SessionOptions::new(),
-        &["serve", "train"],
-        &mut graph,
-        save_dir,
-    )?;
-    let session = &bundle.session;
-    let signature = bundle.meta_graph_def().get_signature(REGRESS_METHOD_NAME)?;
-    let input_info = signature.get_input(REGRESS_INPUTS)?;
-    let output_info = signature.get_output(REGRESS_OUTPUTS)?;
-    let input_op = graph.operation_by_name_required(&input_info.name().name)?;
-    let output_op = graph.operation_by_name_required(&output_info.name().name)?;
+//TODO: scrape this for loading a graph
+// fn eval<P: AsRef<Path>>(save_dir: P) -> Result<(), Box<dyn Error>> {
+//     //load the graph
+//     let mut graph = Graph::new();
+//     let bundle = SavedModelBundle::load(
+//         &SessionOptions::new(),
+//         &["serve", "train"],
+//         &mut graph,
+//         save_dir,
+//     )?;
+//     let session = &bundle.session;
+//     let signature = bundle.meta_graph_def().get_signature(REGRESS_METHOD_NAME)?;
+//     let input_info = signature.get_input(REGRESS_INPUTS)?;
+//     let output_info = signature.get_output(REGRESS_OUTPUTS)?;
+//     let input_op = graph.operation_by_name_required(&input_info.name().name)?;
+//     let output_op = graph.operation_by_name_required(&output_info.name().name)?;
 
-    let mut input_tensor = Tensor::<f32>::new(&[1, 2]);
-    for i in 0..4 {
-        input_tensor[0] = (i & 1) as f32;
-        input_tensor[1] = ((i >> 1) & 1) as f32;
-        let expected = ((i & 1) ^ ((i >> 1) & 1)) as f32;
-        let mut run_args = SessionRunArgs::new();
-        run_args.add_feed(&input_op, input_info.name().index, &input_tensor);
-        let output_fetch = run_args.request_fetch(&output_op, output_info.name().index);
-        session.run(&mut run_args)?;
-        let output = run_args.fetch::<f32>(output_fetch)?[0];
-        let error = (output - expected) * (output - expected);
-        println!("Error: {}", error);
-        if error > 0.1 {
-            return Err(Box::new(Status::new_set(
-                Code::Internal,
-                &format!("Error too high: {}", error),
-            )?));
-        }
-    }
+//     let mut input_tensor = Tensor::<f32>::new(&[1, 2]);
+//     for i in 0..4 {
+//         input_tensor[0] = (i & 1) as f32;
+//         input_tensor[1] = ((i >> 1) & 1) as f32;
+//         let expected = ((i & 1) ^ ((i >> 1) & 1)) as f32;
+//         let mut run_args = SessionRunArgs::new();
+//         run_args.add_feed(&input_op, input_info.name().index, &input_tensor);
+//         let output_fetch = run_args.request_fetch(&output_op, output_info.name().index);
+//         session.run(&mut run_args)?;
+//         let output = run_args.fetch::<f32>(output_fetch)?[0];
+//         let error = (output - expected) * (output - expected);
+//         println!("Error: {}", error);
+//         if error > 0.1 {
+//             return Err(Box::new(Status::new_set(
+//                 Code::Internal,
+//                 &format!("Error too high: {}", error),
+//             )?));
+//         }
+//     }
 
-    Ok(())
-}
-
-pub fn test_main() -> Result<(), Box<dyn Error>> {
-    let mut dir = env::temp_dir();
-    dir.push("tf-rust-example-xor-saved-model");
-    let mut dir2 = env::temp_dir();
-    dir2.push("tf-rust-example-xor-saved-model2");
-    match fs::remove_dir_all(&dir) {
-        Err(e) => {
-            if e.kind() != ErrorKind::NotFound {
-                return Err(Box::new(e));
-            }
-        }
-        Ok(_) => (),
-    }
-    match fs::remove_dir_all(&dir2) {
-        Err(e) => {
-            if e.kind() != ErrorKind::NotFound {
-                return Err(Box::new(e));
-            }
-        }
-        Ok(_) => (),
-    }
-    test_train(&dir)?;
-    // Ensure that the saved model works even when moved.
-    // Users do not need to do this; this is purely for testing purposes.
-    fs::rename(&dir, &dir2)?;
-    eval(&dir2)?;
-    Ok(())
-}
-//TODO: macro for building norm_net: pass in
-//      **args that impl Sized for input
-//      rectangular dimensions of the network
-//      **args that are type that impl Sized for output
-//      fitness function as dyn Fn() -> f32
-//      activation function for hidden layers
-//      (input and output are tanh and this should default to sigmoid, probably shouldnt change must be symmetric)
-
-//TODO: doc tests are preferable to anything else except integration tests as working examples.
-//      unittests must be feature justified and sufficiently complex.
+//     Ok(())
+// }
 
 #[cfg(test)]
 mod tests {
@@ -815,57 +725,26 @@ mod tests {
 
         //CONSTRUCTION//
         let mut scope = Scope::new_root_scope();
-        let norm_net = NormNet::new(&mut scope, 2, 1, 2, 2, 10).unwrap();
-        //pythagorean distance for error because outputs can be negative
-        // TODO: just one scope
-        let error = ops::sqrt(
-            ops::pow(
-                ops::sub(
-                    norm_net.Output.clone(),
-                    norm_net.Label.clone(),
-                    norm_net.scope,
-                )
-                .unwrap(),
-                ops::constant(2.0 as f32, norm_net.scope).unwrap(),
-                norm_net.scope,
-            )
-            .unwrap(),
-            norm_net.scope,
-        )
-        .unwrap();
-        // let error = ops::sqrt(error, scope)?;
-        let error = ops::pow(
-            error.clone(),
-            ops::constant(2.0 as f32, norm_net.scope).unwrap(),
-            norm_net.scope,
-        )
-        .unwrap();
+        let norm_net = NormNet::new(&mut scope, 2, 1, 10, 10, 10, 0.001, 5 as f32).unwrap();
+
+        //FITNESS FUNCTION//
+        //TODO: pass in dyn fitness function instead of hardcoded in class?
 
         //TRAIN//
         let mut rrng = rand::thread_rng();
-        // create an input and output for NormNet using the above XOR generator
-        // let inputs: Vec<&[_]> = vec![&[0.0, 0.0], &[0.0, 1.0], &[1.0, 0.0], &[1.0, 1.0]];
-        // same as above but with f32 instead of double
-        let inputs: Vec<&[_]> = vec![
-            &[0.0 as f32, 0.0 as f32],
-            &[0.0 as f32, 1.0 as f32],
-            &[1.0 as f32, 0.0 as f32],
-            &[1.0 as f32, 1.0 as f32],
-        ];
-        // let outputs: Vec<&[_]> = vec![&[0.0], &[1.0], &[1.0], &[0.0]];
-        let outputs: Vec<&[_]> = vec![&[0.0 as f32], &[1.0 as f32], &[1.0 as f32], &[0.0 as f32]];
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        // create 100 entries for inputs and outputs of xor
+        for _ in 0..100000 {
+            // instead of the above, generate either 0 or 1 and cast to f32
+            let input = vec![(rrng.gen::<u8>() & 1) as f32, (rrng.gen::<u8>() & 1) as f32];
+            let output = vec![(input[0] as u8 ^ input[1] as u8) as f32];
+
+            inputs.push(input);
+            outputs.push(output);
+        }
+
         assert_eq!(inputs.len(), outputs.len());
-        norm_net.train(inputs, outputs, error, 0.001).unwrap();
+        norm_net.train(inputs, outputs).unwrap();
     }
 }
-
-// TODO: make this a lib
-// create a main function
-// pub fn main() {
-//     //call the main function
-//     use crate::*;
-
-//     let res = test_main();
-//     println!("message {:?}", res);
-//     //assert res is Ok:
-// }
