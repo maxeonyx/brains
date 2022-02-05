@@ -1,5 +1,5 @@
 [package]
-name = "Norm_Net"
+name = "NormNet"
 version = "0.1.0"
 authors = ["Corallus-Caninus <ward.joshua92@yahoo.com>"]
 edition = "2021"
@@ -9,11 +9,6 @@ lto=true
 incremental=true
 opt-level=3
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-[lib]
-name = "Norm_net"
-path = "src/lib.rs"
-
 [dependencies]
 enclose = "1.1.8"
 # uinput = "0.1.3"
@@ -21,6 +16,7 @@ toml = "0.5.8"
 serde_derive = "1.0.130"
 serde = "1.0.130"
 tensorflow = {version = "0.17.0", features = ["tensorflow_gpu"]}
+# tensorflow = {version = "0.17.0"}
 rand = "0.8.4"
 half = "1.7.1"
 # windows = { version = "0.26.0", features = ["UI_Input_Preview_Injection", "Foundation_Collections", "build", "std"] }
