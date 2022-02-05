@@ -233,6 +233,7 @@ fn norm_layer_res<O1: Into<Output>>(
     Ok((vec![w.clone()], res))
 }
 
+//TODO: rename this now that methods are introduced and abstractions have occured but keep for low level accessibility
 /// Creates a fully connected network with normalizing layers.
 /// handles all type input and output in the graph, just pass in and expect floats
 /// best data wrangling practices are still recommended, especially normalizing each
@@ -338,7 +339,7 @@ pub fn norm_net(
 //TODO: defaults such as learning rate
 /// a Normalizing Network currently being researched
 /// NOTE: currently inputs and outputs must be flattened if representing >1 dim data
-struct NormNet<'a> {
+pub struct NormNet<'a> {
     ///he scope for tensorflow to prevent having multiple scopes active
     scope: &'a mut Scope,
     ///Session options currently being used
@@ -718,14 +719,15 @@ impl<'a> NormNet<'a> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn test_all() {
-        println!("test_all");
+    fn test_net() {
+        println!("test_net");
         //call the main function
         use crate::*;
 
         //CONSTRUCTION//
         let mut scope = Scope::new_root_scope();
-        let norm_net = NormNet::new(&mut scope, 2, 1, 10, 10, 10, 0.001, 5 as f32).unwrap();
+        let norm_net =
+            NormNet::new(&mut scope, 2, 1, 10, 1000, 1000, 0.0000000000001, 5 as f32).unwrap();
 
         //FITNESS FUNCTION//
         //TODO: pass in dyn fitness function instead of hardcoded in class?
@@ -747,4 +749,9 @@ mod tests {
         assert_eq!(inputs.len(), outputs.len());
         norm_net.train(inputs, outputs).unwrap();
     }
+    //TODO: save/load unittest
+    // fn test_serialization()
+    //save the model
+    //load the model in a seperate object
+    //perform all operations and assert the parameters are the same
 }
