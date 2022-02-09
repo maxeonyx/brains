@@ -334,6 +334,24 @@ pub fn norm_net(
     Ok((net_layers, net_vars, input, label, scope))
 }
 
+///organization struct to handle the paradigm for serialized sessions and graphs (feature disparity in Rust Tensorflow).
+struct Serialized_NormNet {
+    //TODO: non-clonable shared reference movement
+    // SavedModel: SavedModelBundle,
+    session: Session,
+    // graph: &'a Graph,
+    // signature: &'a SignatureDef,
+    input_info: TensorInfo,
+    input: Operation,
+    output_info: TensorInfo,
+    output: Operation,
+    label_info: TensorInfo,
+    label: Operation,
+    error_info: TensorInfo,
+    error: Operation,
+    minimize_info: TensorInfo,
+    minimize: Operation,
+}
 //TODO: save and load from disk
 //TODO: does save/load require UUID? allow user to name in initialization for organization?
 //TODO: defaults such as learning rate
@@ -359,6 +377,7 @@ pub struct NormNet<'a> {
     minimize_vars: Vec<Variable>,
     minimize: Operation,
     SavedModelSaver: RefCell<Option<SavedModelSaver>>,
+    Serialized_NormNet: Option<Serialized_NormNet>,
 }
 impl<'a> NormNet<'a> {
     pub fn new(
@@ -460,7 +479,7 @@ impl<'a> NormNet<'a> {
         let Error = ops::pow(
             Error.clone(),
             ops::constant(error_power, scope).unwrap(),
-            scope,
+            &mut scope.with_op_name("error"),
         )
         .unwrap();
 
@@ -489,12 +508,14 @@ impl<'a> NormNet<'a> {
             minimize_vars,
             minimize,
             SavedModelSaver: init_saved_model_saver,
+            Serialized_NormNet: None,
         })
     }
     // forward pass and return result
     // fn infer
     //one time traning that can take output of infer and a label
     // fn backprop
+
     //save the model out to disk in this directory as default
     pub fn save(self) -> Result<(), Box<dyn Error>> {
         // save the model to disk in the current directory
@@ -504,7 +525,7 @@ impl<'a> NormNet<'a> {
             all_vars.extend_from_slice(&self.minimize_vars);
             let mut builder = tensorflow::SavedModelBuilder::new();
             builder
-                .add_collection("train", &all_vars)
+                .add_collection("train_vars", &all_vars)
                 .add_tag("serve")
                 .add_tag("train")
                 .add_signature(REGRESS_METHOD_NAME, {
@@ -520,20 +541,45 @@ impl<'a> NormNet<'a> {
                             },
                         ),
                     );
+                    def.add_input_info(
+                        "label".to_string(),
+                        TensorInfo::new(
+                            DataType::Float,
+                            Shape::from(None),
+                            OutputName {
+                                name: self.Label.name()?,
+                                index: 0,
+                            },
+                        ),
+                    );
+                    //NOTE: we only need this for reporting learning position for learning rate
+                    def.add_input_info(
+                        "error".to_string(),
+                        TensorInfo::new(
+                            DataType::Float,
+                            Shape::from(None),
+                            OutputName {
+                                name: self.Error.name()?,
+                                index: 0,
+                            },
+                        ),
+                    );
+                    def.add_input_info(
+                        "minimize".to_string(),
+                        TensorInfo::new(
+                            DataType::Float,
+                            Shape::from(None),
+                            OutputName {
+                                name: self.minimize.name()?,
+                                index: 0,
+                            },
+                        ),
+                    );
                     def.add_output_info(
                         REGRESS_OUTPUTS.to_string(),
                         TensorInfo::new(DataType::Float, Shape::from(None), self.Output.name()?),
                     );
-                    //add error
-                    // def.add_output_info(
-                    //     "error".to_string(),
-                    //     TensorInfo::new(DataType::Float, Shape::from(None), Error.name()),
-                    // );
-                    //add label
-                    // def.add_output_info(
-                    //     "label".to_string(),
-                    //     TensorInfo::new(DataType::Float, Shape::from(None), "Label"),
-                    // );
+
                     def
                 });
             let saved_model_saver = builder.inject(self.scope)?;
@@ -549,40 +595,155 @@ impl<'a> NormNet<'a> {
         Ok(())
     }
 
-    //TODO: load
-    // pub fn load(self) {
-    //     // load the model from disk in the current directory
-    //     println!("loading previously saved model..");
-    //     //TODO: check examples in tensorflow rust for solution:
-    //     // load the model from the saved model saver for this training session
-    //     let save_dir = std::env::current_dir().unwrap();
-    //     let mut graph = Graph::new();
-    //     let bundle = SavedModelBundle::load(
-    //         //TODO: test here that this overwrites correctly
-    //         // &SessionOptions::new(),
-    //         &self.session_options,
-    //         &["serve", "train"],
-    //         &mut graph,
-    //         save_dir,
-    //     )?;
-    //     //TODO: associate the operations with the class state
-    //     let session = &bundle.session;
-    //     let signature = bundle.meta_graph_def().get_signature(REGRESS_METHOD_NAME)?;
-    //     let input_info = signature.get_input(REGRESS_INPUTS)?;
-    //     let output_info = signature.get_output(REGRESS_OUTPUTS)?;
-    //     let error_info = signature.get_output("error")?;
-    //     //TODO: test
-    //     // let label_info = signature.get_output("label")?;
-    //     //TODO: associate the operations with the class state
-    //     //TODO: get variables from collection and associate with the class state, this should be all that is actually needed however.
-    //     let input = graph.operation_by_name_required(&input_info.name().name)?;
-    //     let output = graph.operation_by_name_required(&output_info.name().name)?;
-    //     let error = graph.operation_by_name_required(&self.Error.name()?)?;
-    //     // let label = graph.operation_by_name_required(&label_info.name().name)?;
-    // }
+    ///load the model from disk and store it in self.Serialized_NormNet
+    pub fn load(&'a mut self) -> Result<(), Box<dyn Error>> {
+        // load the model from disk in the current directory
+        println!("loading previously saved model..");
+        //TODO: check examples in tensorflow rust for solution:
+        // load the model from the saved model saver for this training session
+        let save_dir = std::env::current_dir().unwrap();
+        let mut graph = Graph::new();
+        //TODO: ensure we can access variables from graph or otherwise
+        let bundle = SavedModelBundle::load(
+            //TODO: test here that this overwrites correctly
+            // &SessionOptions::new(),
+            &self.session_options,
+            &["serve", "train"],
+            &mut graph,
+            save_dir,
+        )?;
+        //TODO: associate the operations with the class state
+        // let session = &bundle.session;
+        let signature = bundle
+            .meta_graph_def()
+            .get_signature(REGRESS_METHOD_NAME)?
+            .clone();
+        //TODO: ensure cloning the bits in the construction below retains the proper graph pointers
+        // let input_info = signature.get_input(REGRESS_INPUTS)?;
+        // let label_info = signature.get_input("label")?;
+        // let error_info = signature.get_input("error")?;
+        // let minimize_info = signature.get_input("minimize")?;
+        // let output_info = signature.get_output(REGRESS_OUTPUTS)?;
+        // let input = graph.operation_by_name_required(&input_info.name().name)?;
+        // let label = graph.operation_by_name_required(&label_info.name().name)?;
+        // let error = graph.operation_by_name_required(&error_info.name().name)?;
+        // let minimize = graph.operation_by_name_required(&minimize_info.name().name)?;
+        // let output = graph.operation_by_name_required(&output_info.name().name)?;
+        // now associate the operations with the class state by creating Some(Serialized_NormNet)
+        self.Serialized_NormNet = Some(Serialized_NormNet {
+            // SavedModel: bundle,
+            session: bundle.session,
+            // graph: &graph,
+            // signature: &signature,
+            input_info: signature.get_input(REGRESS_INPUTS)?.clone(),
+            input: graph
+                .operation_by_name_required(&signature.get_input(REGRESS_INPUTS)?.name().name)?,
+            output_info: signature.get_output(REGRESS_OUTPUTS)?.clone(),
+            output: graph
+                .operation_by_name_required(&signature.get_output(REGRESS_OUTPUTS)?.name().name)?,
+            label_info: signature.get_input("label")?.clone(),
+            label: graph.operation_by_name_required(&signature.get_input("label")?.name().name)?,
+            error_info: signature.get_input("error")?.clone(),
+            error: graph.operation_by_name_required(&signature.get_input("error")?.name().name)?,
+            minimize_info: signature.get_input("minimize")?.clone(),
+            minimize: graph
+                .operation_by_name_required(&signature.get_input("minimize")?.name().name)?,
+        });
+        Ok(())
+    }
+    ///TODO: pub fn serialize(self, uuid) // serialize NormNet including the session-graph to disk
+
+    //TODO:
+    ///train the network with theGiven inputs and labelswhich must be
+    /// synchronized in index order initializes a saved model saver if not already initialized and saves after training.
+    pub fn train_checkpoint<T: tensorflow::TensorType>(
+        self,
+        inputs: Vec<Vec<T>>,
+        labels: Vec<Vec<T>>,
+        // TODO: pass these is instead of constructing
+        // error: Operation,
+        // learning_rate: f32,
+    ) -> Result<Vec<Tensor<f32>>, Status> {
+        //TODO: allow to change learning rate and error here
+        // load the model if it has been saved otherwise initialize a saved model saver
+        //TODO: extract this so we can call it in other training methods as a "refresh" serialization synchronization
+        // TODO: also a sub method for save() and load()
+
+        let g = self.scope.graph_mut();
+        let session = Session::new(&self.session_options, &g)?;
+        let mut run_args = SessionRunArgs::new();
+
+        // set parameters to be optimization targets
+        for var in &self.net_vars {
+            run_args.add_target(&var.initializer());
+        }
+        for var in &self.minimize_vars {
+            run_args.add_target(&var.initializer());
+        }
+        session.run(&mut run_args)?;
+
+        //TODO: shouldnt need to initialize so much ITL
+        //TODO: randomize input and labels and k-fold
+        //TODO: create dataset structure
+        println!("trainning..");
+        let mut result = vec![];
+
+        let mut input_tensor: Tensor<T> = Tensor::new(&[1u64, inputs[0].len() as u64]);
+        // print inputs[0].len();
+        println!("inputs.len(): {}", inputs.len());
+        println!("{}", inputs[0].len());
+        let mut label_tensor: Tensor<T> = Tensor::new(&[1u64, labels[0].len() as u64]);
+        println!("{}", labels[0].len());
+        // let layer5_output_fetch = run_args.request_fetch(&layer1_output, 0);
+        let mut input_iter = inputs.into_iter();
+        let mut label_iter = labels.into_iter();
+        input_iter.next();
+        label_iter.next();
+        let mut i = 0;
+        loop {
+            i += 1;
+            let input = input_iter.next();
+            let label = label_iter.next();
+            if input.is_none() || label.is_none() {
+                break;
+            }
+            let input = input.unwrap();
+            let label = label.unwrap();
+            // now get input and label as slices
+            let input = input.as_slice();
+            let label = label.as_slice();
+            // now assign the input and label to the tensor
+            for i in 0..input.len() {
+                input_tensor[i] = input[i].clone();
+            }
+            for i in 0..label.len() {
+                label_tensor[i] = label[i].clone();
+            }
+
+            let mut run_args = SessionRunArgs::new();
+            run_args.add_target(&self.minimize);
+
+            let error_squared_fetch = run_args.request_fetch(&self.Error, 0);
+            run_args.add_feed(&self.Input, 0, &input_tensor);
+            run_args.add_feed(&self.Label, 0, &label_tensor);
+            session.run(&mut run_args)?;
+
+            let res: Tensor<f32> = run_args.fetch(error_squared_fetch)?;
+
+            // do the above prints in one line
+            println!(
+                "training on {}\n input: {:?} label: {:?} error: {}",
+                i, input, label, res
+            );
+
+            result.push(res);
+        }
+
+        //TODO: save the model
+        Ok(result)
+    }
 
     /// train the network with the given inputs and labels (must be synchronized in index order)
-    /// initializes a saved model saver if not already initialized and saves after trainning.
     ///PARAMETERS:
     /// inputs: the inputs to the network as a flattened 1D vector
     /// labels: the labels for the inputs as a flattened 1D vector, must align index wise with inputs. (e.g. inputs[0] must be labeled as labels[0])
@@ -662,6 +823,7 @@ impl<'a> NormNet<'a> {
             session.run(&mut run_args)?;
 
             let res: Tensor<f32> = run_args.fetch(error_squared_fetch)?;
+
             // do the above prints in one line
             println!(
                 "training on {}\n input: {:?} label: {:?} error: {}",
@@ -727,7 +889,7 @@ mod tests {
         //CONSTRUCTION//
         let mut scope = Scope::new_root_scope();
         let norm_net =
-            NormNet::new(&mut scope, 2, 1, 10, 1000, 1000, 0.0000000000001, 5 as f32).unwrap();
+            NormNet::new(&mut scope, 2, 1, 10, 10, 10, 0.0000000000001, 5 as f32).unwrap();
 
         //FITNESS FUNCTION//
         //TODO: pass in dyn fitness function instead of hardcoded in class?
