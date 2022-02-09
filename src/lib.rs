@@ -339,7 +339,7 @@ struct Serialized_NormNet {
     //TODO: non-clonable shared reference movement
     // SavedModel: SavedModelBundle,
     session: Session,
-    // graph: &'a Graph,
+    graph: Graph,
     // signature: &'a SignatureDef,
     input_info: TensorInfo,
     input: Operation,
@@ -633,7 +633,6 @@ impl<'a> NormNet<'a> {
         self.Serialized_NormNet = Some(Serialized_NormNet {
             // SavedModel: bundle,
             session: bundle.session,
-            // graph: &graph,
             // signature: &signature,
             input_info: signature.get_input(REGRESS_INPUTS)?.clone(),
             input: graph
@@ -648,6 +647,8 @@ impl<'a> NormNet<'a> {
             minimize_info: signature.get_input("minimize")?.clone(),
             minimize: graph
                 .operation_by_name_required(&signature.get_input("minimize")?.name().name)?,
+            //NOTE: shouldnt need to interact with the graph after this, ablate this due to abstraction once tested
+            graph: graph,
         });
         Ok(())
     }
