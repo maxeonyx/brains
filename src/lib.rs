@@ -1,5 +1,10 @@
-//! Deep reinforcment learning algorithm for Rattus to predict the location of the next click and with what probability.
-//! uses (i32,i32,f32) where the first i32 tuple is the location in x and y coordinates and f32 is the confidence probability of the click from 0-1.
+//! NormNet: a Deep Artificial Neural Network using normalizing neurons to investigate alternatives to bias
+//! based expressivity. Gradient based connection-wise dropout is also included due to the numeric properties
+//! inherent to normalization (thanks to a little trig and calculus). This allows NormNet to also be a sparse-searching
+//! "top down" architecture search where the parameters are recoverable thanks again to the gradient.
+//! It is hypothesized and investigated here that the aforementioned features will lead to much more robust transfer
+//! learning and therein generalization. The only significant downsides to this is a division by constant operation on each node
+//! (seemingly/empirically not as bad as it sounds).
 
 //TODO: allow this to fallback to TF-CPU for machines without GPU and possibly just do inference with a build script.
 //TODO: floats stink norm net is an attempt to realizing rot net and uint8 operations with bounded functions while retaining all the flaws in DNNs..
@@ -16,11 +21,14 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::result::Result;
 //TODO: clean this up with proper heirachy
+use rand::Rng;
+use std::os;
 use tensorflow::ops;
 use tensorflow::train::AdadeltaOptimizer;
 use tensorflow::train::GradientDescentOptimizer;
 use tensorflow::train::MinimizeOptions;
 use tensorflow::train::Optimizer;
+use tensorflow::BFloat16;
 use tensorflow::Code;
 use tensorflow::DataType;
 use tensorflow::Graph;
@@ -42,9 +50,7 @@ use tensorflow::Variable;
 use tensorflow::REGRESS_INPUTS;
 use tensorflow::REGRESS_METHOD_NAME;
 use tensorflow::REGRESS_OUTPUTS;
-//import rand
-use rand::Rng;
-use tensorflow::BFloat16;
+use uuid::Uuid;
 
 /// A standard fully connected layer with bias term
 ///
@@ -90,49 +96,6 @@ fn layer<O1: Into<Output>>(
     ))
 }
 
-//TODO: extract into class
-//================
-//----NORM_NET----
-//================
-/// A standard fully connected layer without bias trainnable parameters
-/// instead normalizing and dropping out connections at each node.
-///
-///
-/// #
-/// PROS:
-///
-/// * better exploration by removing instabilities inherent to bias
-///        
-/// * gradient based connection-wise dropout with tan weights
-///       
-/// * better transfer learning by removing bias connections
-///       
-/// * ~shouldn't~ have exploding gradient although vanishing gradient may be possible (also shouldn't be a problem but less hypothesized)
-///          due to normalizing division.
-///      
-/// * technically connection wise dropout is divisive (top down) architecture search (e.g.: the opposite of NEAT (bottom up) which is agglomerative)
-///
-/// CONS:
-/// * may be slower due to more operations
-///       
-/// * input and output must/should be tailored for normalized input/output (standard data science practices)
-///       
-/// * needs large type precision for stability, but the stability can be tuned (as apposed to bias which needs architectural considerations)
-///
-/// #
-/// NOTE: parameters goes to zero whereas biases find some 1-dimensional partition from -inf to inf. This helps
-/// builds subgraph search modules (subtrees essentially). That can quickly optimize for distinct domains and labels via dropout.
-///
-/// NOTE:
-/// Tanh should be on the first and last layers to map inputs and outputs to negative values.
-/// Dividing the input to be between -1 and 1 and multiplying the output by some multiple of
-/// 10 allows the otherwise normalized network to take in and output whole integers.
-///
-/// NOTE:
-/// We dont use BFloat since the integer range is only used as a buffer for addition overflow in matmul.
-/// In all other operations we are strictly bounded -1 > x > 1. As long as layer_width is not
-/// greater than Float range we are fine in the worst case (summing all 1's).
-/// Otherwise decimal precision of float type is our parameter type precision.
 pub fn norm_layer<O1: Into<Output>>(
     input: O1,
     input_size: u64,
@@ -355,15 +318,55 @@ struct Serialized_NormNet {
 //TODO: save and load from disk
 //TODO: does save/load require UUID? allow user to name in initialization for organization?
 //TODO: defaults such as learning rate
-/// a Normalizing Network currently being researched
+//================
+//----NORM_NET----
+//================
+/// A standard fully connected layer without bias trainnable parameters
+/// instead normalizing and dropping out connections at each node.
+///
 /// NOTE: currently inputs and outputs must be flattened if representing >1 dim data
+///
+/// #
+/// PROS:
+///
+/// * better exploration by removing instabilities inherent to bias
+///        
+/// * gradient based connection-wise dropout with tan weights
+///       
+/// * better transfer learning by removing bias connections
+///       
+/// * ~shouldn't~ have exploding gradient although vanishing gradient may be possible due to normalizing division.
+///      
+/// * technically connection wise dropout is divisive (top down) architecture search (e.g.: the opposite of NEAT (bottom up) which is agglomerative)
+///
+/// CONS:
+/// * may be slower due to more operations (division)
+///       
+/// * input and output must/should be tailored for normalized input/output (standard data science practices)
+///       
+/// * needs large type precision for stability, but the stability can be tuned (as apposed to bias which needs architectural considerations)
+///
+/// #
+/// NOTE: parameters goes to zero whereas biases find some 1-dimensional partition from -inf to inf. This helps
+/// build subgraph search modules (subtrees essentially). That can quickly optimize for distinct domains and labels via dropout.
+///
+/// NOTE:
+/// Tanh should the first and last layers activation function to map inputs and outputs to negative values.
+/// multiplying the output by some multiple of 10 allows the otherwise normalized network to take in and output whole integers.
+/// -x > y > x | x > 1
+///
+/// NOTE:
+/// We dont use BFloat since the integer range is only used as a buffer for addition overflow in matmul.
+/// In all other operations we are strictly bounded -1 > x > 1. As long as layer_width is not
+/// greater than Float range we are fine in the worst case (summing all 1's).
+/// Otherwise decimal precision of float type is our parameter type precision.
 pub struct NormNet<'a> {
     ///he scope for tensorflow to prevent having multiple scopes active
     scope: &'a mut Scope,
     ///Session options currently being used
     session: Option<Session>,
     session_options: SessionOptions,
-    graph: Option<Graph>,
+    // graph: Option<Graph>,
     ///each layers output hook of the network
     net_layers: Vec<Output>,
     ///all the parameters of the network
@@ -391,6 +394,8 @@ impl<'a> NormNet<'a> {
         //a power to raise the pythagorean distance error to for gradient scaling error_
         error_power: f32,
     ) -> Result<NormNet, Status> {
+        assert!(max_integer % 10 == 0, "max_integer must be a multiple of 10 since it represents order of magnitude of the integer range");
+
         // TODO: consider inlining this since were encapsulating
         let Input = ops::Placeholder::new()
             .dtype(DataType::Float)
@@ -491,13 +496,14 @@ impl<'a> NormNet<'a> {
             )?
             .into();
 
-        // let mut run_args = SessionRunArgs::new();
+        // TODO: initialize session and graph here?
 
         Ok(NormNet {
             scope,
             session: None,
             session_options: options,
-            graph: None,
+            //TODO: does this need to be declared or can we always self.scope.graph()? may conflict if user is using scope for other things
+            // graph: None,
             net_layers,
             net_vars,
             Input,
@@ -511,15 +517,22 @@ impl<'a> NormNet<'a> {
             Serialized_NormNet: None,
         })
     }
+
     // forward pass and return result
     // fn infer
     //one time traning that can take output of infer and a label
     // fn backprop
 
     //save the model out to disk in this directory as default
-    pub fn save(self) -> Result<(), Box<dyn Error>> {
+    pub fn save(&mut self, dir: String) -> Result<(), Box<dyn Error>> {
         // save the model to disk in the current directory
         if self.SavedModelSaver.borrow().is_none() {
+            //TODO: this should be in constructor but is here currently because borrow checker problems
+            if self.session.is_none() {
+                let mut session_options = &self.session_options;
+                let session = Session::new(&session_options, &self.scope.graph())?;
+                self.session = Some(session);
+            }
             println!("initializing saved model saver..");
             let mut all_vars = self.net_vars.clone();
             all_vars.extend_from_slice(&self.minimize_vars);
@@ -585,23 +598,25 @@ impl<'a> NormNet<'a> {
             let saved_model_saver = builder.inject(self.scope)?;
             self.SavedModelSaver.replace(Some(saved_model_saver));
         }
-        // self.SavedModelSaver.borrow_mut().as_mut().unwrap().save();
-        // same as above  but pass savedmodelsaver session graph and save directory
+        // generate a uuid
+        let uuid = Uuid::new_v4();
         self.SavedModelSaver.borrow_mut().as_mut().unwrap().save(
-            &self.session.unwrap(),
-            &self.graph.unwrap(),
-            "./",
+            &self.session.as_ref().unwrap(),
+            // &self.graph.unwrap(),
+            &self.scope.graph(),
+            //TODO: ensure this is cur_directory and pass in user specification with this as default
+            format!("{}/{}", dir, uuid),
         )?;
         Ok(())
     }
 
     ///load the model from disk and store it in self.Serialized_NormNet
-    pub fn load(&'a mut self) -> Result<(), Box<dyn Error>> {
+    pub fn load(&'a mut self, dir: String) -> Result<(), Box<dyn Error>> {
         // load the model from disk in the current directory
         println!("loading previously saved model..");
         //TODO: check examples in tensorflow rust for solution:
         // load the model from the saved model saver for this training session
-        let save_dir = std::env::current_dir().unwrap();
+        // let save_dir = std::env::current_dir().unwrap();
         let mut graph = Graph::new();
         //TODO: ensure we can access variables from graph or otherwise
         let bundle = SavedModelBundle::load(
@@ -610,7 +625,7 @@ impl<'a> NormNet<'a> {
             &self.session_options,
             &["serve", "train"],
             &mut graph,
-            save_dir,
+            dir,
         )?;
         //TODO: associate the operations with the class state
         // let session = &bundle.session;
@@ -752,7 +767,7 @@ impl<'a> NormNet<'a> {
     /// learning_rate: the learning rate for the network (e.g. 0.001)
     pub fn train<T: tensorflow::TensorType>(
         // &mut self,
-        self,
+        &mut self,
         inputs: Vec<Vec<T>>,
         labels: Vec<Vec<T>>,
         // TODO: pass these is instead of constructing
@@ -764,7 +779,7 @@ impl<'a> NormNet<'a> {
         //TODO: extract this so we can call it in other training methods as a "refresh" serialization synchronization
         // TODO: also a sub method for save() and load()
 
-        let g = self.scope.graph_mut();
+        let g = self.scope.graph();
         let session = Session::new(&self.session_options, &g)?;
         let mut run_args = SessionRunArgs::new();
 
@@ -835,49 +850,13 @@ impl<'a> NormNet<'a> {
         }
 
         //TODO: save the model
+        //if self.session is none save it
+        if self.session.is_none() {
+            self.session = Some(session);
+        }
         Ok(result)
     }
 }
-
-//TODO: scrape this for loading a graph
-// fn eval<P: AsRef<Path>>(save_dir: P) -> Result<(), Box<dyn Error>> {
-//     //load the graph
-//     let mut graph = Graph::new();
-//     let bundle = SavedModelBundle::load(
-//         &SessionOptions::new(),
-//         &["serve", "train"],
-//         &mut graph,
-//         save_dir,
-//     )?;
-//     let session = &bundle.session;
-//     let signature = bundle.meta_graph_def().get_signature(REGRESS_METHOD_NAME)?;
-//     let input_info = signature.get_input(REGRESS_INPUTS)?;
-//     let output_info = signature.get_output(REGRESS_OUTPUTS)?;
-//     let input_op = graph.operation_by_name_required(&input_info.name().name)?;
-//     let output_op = graph.operation_by_name_required(&output_info.name().name)?;
-
-//     let mut input_tensor = Tensor::<f32>::new(&[1, 2]);
-//     for i in 0..4 {
-//         input_tensor[0] = (i & 1) as f32;
-//         input_tensor[1] = ((i >> 1) & 1) as f32;
-//         let expected = ((i & 1) ^ ((i >> 1) & 1)) as f32;
-//         let mut run_args = SessionRunArgs::new();
-//         run_args.add_feed(&input_op, input_info.name().index, &input_tensor);
-//         let output_fetch = run_args.request_fetch(&output_op, output_info.name().index);
-//         session.run(&mut run_args)?;
-//         let output = run_args.fetch::<f32>(output_fetch)?[0];
-//         let error = (output - expected) * (output - expected);
-//         println!("Error: {}", error);
-//         if error > 0.1 {
-//             return Err(Box::new(Status::new_set(
-//                 Code::Internal,
-//                 &format!("Error too high: {}", error),
-//             )?));
-//         }
-//     }
-
-//     Ok(())
-// }
 
 #[cfg(test)]
 mod tests {
@@ -889,7 +868,8 @@ mod tests {
 
         //CONSTRUCTION//
         let mut scope = Scope::new_root_scope();
-        let norm_net =
+        //TODO: once session is in constructor remove the optionals and this
+        let mut norm_net =
             NormNet::new(&mut scope, 2, 1, 10, 10, 10, 0.0000000000001, 5 as f32).unwrap();
 
         //FITNESS FUNCTION//
@@ -912,9 +892,56 @@ mod tests {
         assert_eq!(inputs.len(), outputs.len());
         norm_net.train(inputs, outputs).unwrap();
     }
+
     //TODO: save/load unittest
-    // fn test_serialization()
-    //save the model
-    //load the model in a seperate object
-    //perform all operations and assert the parameters are the same
+    #[test]
+    fn test_serialization() {
+        println!("test_serialization");
+        //call the main function
+        use crate::*;
+
+        //CONSTRUCTION//
+        let mut scope = Scope::new_root_scope();
+        let mut norm_net =
+            NormNet::new(&mut scope, 2, 1, 10, 10, 10, 0.0000000000001, 5 as f32).unwrap();
+        //TRAIN//
+        let mut rrng = rand::thread_rng();
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        // create 100 entries for inputs and outputs of xor
+        for _ in 0..10 {
+            // instead of the above, generate either 0 or 1 and cast to f32
+            let input = vec![(rrng.gen::<u8>() & 1) as f32, (rrng.gen::<u8>() & 1) as f32];
+            let output = vec![(input[0] as u8 ^ input[1] as u8) as f32];
+
+            inputs.push(input);
+            outputs.push(output);
+        }
+
+        assert_eq!(inputs.len(), outputs.len());
+        norm_net.train(inputs, outputs).unwrap();
+
+        // save the network
+        norm_net
+            .save("test_serialized_models/".to_string())
+            .unwrap();
+
+        //load the network
+        let mut path = "";
+        //NOTE: dont ever call a string something else in your crates or someone I know will find you.
+        let mut e = std::path::PathBuf::new();
+        for entry in fs::read_dir("test_serialized_models/").unwrap() {
+            let entry = entry.unwrap();
+            e = entry.path();
+            path = e.to_str().unwrap();
+            println!("{:?}", path);
+        }
+        let path = path.to_string();
+        println!("{:?}", path);
+
+        norm_net.load(path.to_string()).unwrap();
+
+        //TODO: delete everything in test_serialized_models
+        //TODO: perform all operations and assert the parameters are the same
+    }
 }

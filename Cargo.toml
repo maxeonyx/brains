@@ -19,6 +19,8 @@ tensorflow = {version = "0.17.0", features = ["tensorflow_gpu"]}
 # tensorflow = {version = "0.17.0"}
 rand = "0.8.4"
 half = "1.7.1"
+itertools = "0.10.3"
+uuid = { version = "0.8.2", features = ["v4"] }
 # windows = { version = "0.26.0", features = ["UI_Input_Preview_Injection", "Foundation_Collections", "build", "std"] }
 # windows_macros = "0.28.0"
 # winapi = "0.3.9"
