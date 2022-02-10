@@ -298,7 +298,7 @@ pub fn norm_net(
 }
 
 ///organization struct to handle the paradigm for serialized sessions and graphs (feature disparity in Rust Tensorflow).
-struct Serialized_NormNet {
+struct Serialized {
     //TODO: non-clonable shared reference movement
     // SavedModel: SavedModelBundle,
     session: Session,
@@ -361,10 +361,10 @@ struct Serialized_NormNet {
 /// greater than Float range we are fine in the worst case (summing all 1's).
 /// Otherwise decimal precision of float type is our parameter type precision.
 pub struct NormNet<'a> {
-    ///he scope for tensorflow to prevent having multiple scopes active
+    ///the scope for tensorflow to prevent having multiple scopes active
     scope: &'a mut Scope,
     ///Session options currently being used
-    session: Option<Session>,
+    session: Session,
     session_options: SessionOptions,
     // graph: Option<Graph>,
     ///each layers output hook of the network
@@ -380,7 +380,7 @@ pub struct NormNet<'a> {
     minimize_vars: Vec<Variable>,
     minimize: Operation,
     SavedModelSaver: RefCell<Option<SavedModelSaver>>,
-    Serialized_NormNet: Option<Serialized_NormNet>,
+    Serialized: Option<Serialized>,
 }
 impl<'a> NormNet<'a> {
     pub fn new(
@@ -495,12 +495,13 @@ impl<'a> NormNet<'a> {
                 MinimizeOptions::default().with_variables(&net_vars),
             )?
             .into();
+        let session = Session::new(&options, &mut scope.graph())?;
 
         // TODO: initialize session and graph here?
 
         Ok(NormNet {
             scope,
-            session: None,
+            session: session,
             session_options: options,
             //TODO: does this need to be declared or can we always self.scope.graph()? may conflict if user is using scope for other things
             // graph: None,
@@ -514,7 +515,7 @@ impl<'a> NormNet<'a> {
             minimize_vars,
             minimize,
             SavedModelSaver: init_saved_model_saver,
-            Serialized_NormNet: None,
+            Serialized: None,
         })
     }
 
@@ -528,11 +529,12 @@ impl<'a> NormNet<'a> {
         // save the model to disk in the current directory
         if self.SavedModelSaver.borrow().is_none() {
             //TODO: this should be in constructor but is here currently because borrow checker problems
-            if self.session.is_none() {
-                let mut session_options = &self.session_options;
-                let session = Session::new(&session_options, &self.scope.graph())?;
-                self.session = Some(session);
-            }
+            // if self.session.is_none() {
+            // let mut session_options = &self.session_options;
+            // let session = Session::new(&session_options, &self.scope.graph())?;
+            // let session = self.session;
+            // self.session = Some(session);
+            // }
             println!("initializing saved model saver..");
             let mut all_vars = self.net_vars.clone();
             all_vars.extend_from_slice(&self.minimize_vars);
@@ -601,7 +603,7 @@ impl<'a> NormNet<'a> {
         // generate a uuid
         let uuid = Uuid::new_v4();
         self.SavedModelSaver.borrow_mut().as_mut().unwrap().save(
-            &self.session.as_ref().unwrap(),
+            &self.session,
             // &self.graph.unwrap(),
             &self.scope.graph(),
             //TODO: ensure this is cur_directory and pass in user specification with this as default
@@ -610,7 +612,7 @@ impl<'a> NormNet<'a> {
         Ok(())
     }
 
-    ///load the model from disk and store it in self.Serialized_NormNet
+    ///load the model from disk and store it in self.Serialized
     pub fn load(&'a mut self, dir: String) -> Result<(), Box<dyn Error>> {
         // load the model from disk in the current directory
         println!("loading previously saved model..");
@@ -644,8 +646,8 @@ impl<'a> NormNet<'a> {
         // let error = graph.operation_by_name_required(&error_info.name().name)?;
         // let minimize = graph.operation_by_name_required(&minimize_info.name().name)?;
         // let output = graph.operation_by_name_required(&output_info.name().name)?;
-        // now associate the operations with the class state by creating Some(Serialized_NormNet)
-        self.Serialized_NormNet = Some(Serialized_NormNet {
+        // now associate the operations with the class state by creating Some(Serialized)
+        self.Serialized = Some(Serialized {
             // SavedModel: bundle,
             session: bundle.session,
             // signature: &signature,
@@ -665,6 +667,7 @@ impl<'a> NormNet<'a> {
             //NOTE: shouldnt need to interact with the graph after this, ablate this due to abstraction once tested
             graph: graph,
         });
+        // set the variables to be the loaded variables
         Ok(())
     }
     ///TODO: pub fn serialize(self, uuid) // serialize NormNet including the session-graph to disk
@@ -672,92 +675,15 @@ impl<'a> NormNet<'a> {
     //TODO:
     ///train the network with theGiven inputs and labelswhich must be
     /// synchronized in index order initializes a saved model saver if not already initialized and saves after training.
-    pub fn train_checkpoint<T: tensorflow::TensorType>(
-        self,
-        inputs: Vec<Vec<T>>,
-        labels: Vec<Vec<T>>,
-        // TODO: pass these is instead of constructing
-        // error: Operation,
-        // learning_rate: f32,
-    ) -> Result<Vec<Tensor<f32>>, Status> {
-        //TODO: allow to change learning rate and error here
-        // load the model if it has been saved otherwise initialize a saved model saver
-        //TODO: extract this so we can call it in other training methods as a "refresh" serialization synchronization
-        // TODO: also a sub method for save() and load()
-
-        let g = self.scope.graph_mut();
-        let session = Session::new(&self.session_options, &g)?;
-        let mut run_args = SessionRunArgs::new();
-
-        // set parameters to be optimization targets
-        for var in &self.net_vars {
-            run_args.add_target(&var.initializer());
-        }
-        for var in &self.minimize_vars {
-            run_args.add_target(&var.initializer());
-        }
-        session.run(&mut run_args)?;
-
-        //TODO: shouldnt need to initialize so much ITL
-        //TODO: randomize input and labels and k-fold
-        //TODO: create dataset structure
-        println!("trainning..");
-        let mut result = vec![];
-
-        let mut input_tensor: Tensor<T> = Tensor::new(&[1u64, inputs[0].len() as u64]);
-        // print inputs[0].len();
-        println!("inputs.len(): {}", inputs.len());
-        println!("{}", inputs[0].len());
-        let mut label_tensor: Tensor<T> = Tensor::new(&[1u64, labels[0].len() as u64]);
-        println!("{}", labels[0].len());
-        // let layer5_output_fetch = run_args.request_fetch(&layer1_output, 0);
-        let mut input_iter = inputs.into_iter();
-        let mut label_iter = labels.into_iter();
-        input_iter.next();
-        label_iter.next();
-        let mut i = 0;
-        loop {
-            i += 1;
-            let input = input_iter.next();
-            let label = label_iter.next();
-            if input.is_none() || label.is_none() {
-                break;
-            }
-            let input = input.unwrap();
-            let label = label.unwrap();
-            // now get input and label as slices
-            let input = input.as_slice();
-            let label = label.as_slice();
-            // now assign the input and label to the tensor
-            for i in 0..input.len() {
-                input_tensor[i] = input[i].clone();
-            }
-            for i in 0..label.len() {
-                label_tensor[i] = label[i].clone();
-            }
-
-            let mut run_args = SessionRunArgs::new();
-            run_args.add_target(&self.minimize);
-
-            let error_squared_fetch = run_args.request_fetch(&self.Error, 0);
-            run_args.add_feed(&self.Input, 0, &input_tensor);
-            run_args.add_feed(&self.Label, 0, &label_tensor);
-            session.run(&mut run_args)?;
-
-            let res: Tensor<f32> = run_args.fetch(error_squared_fetch)?;
-
-            // do the above prints in one line
-            println!(
-                "training on {}\n input: {:?} label: {:?} error: {}",
-                i, input, label, res
-            );
-
-            result.push(res);
-        }
-
-        //TODO: save the model
-        Ok(result)
-    }
+    // pub fn train_checkpoint<T: tensorflow::TensorType>(
+    //     self,
+    //     inputs: Vec<Vec<T>>,
+    //     labels: Vec<Vec<T>>,
+    //     // TODO: pass these is instead of constructing
+    //     // error: Operation,
+    //     // learning_rate: f32,
+    // ) -> Result<Vec<Tensor<f32>>, Status> {
+    // }
 
     /// train the network with the given inputs and labels (must be synchronized in index order)
     ///PARAMETERS:
@@ -780,7 +706,6 @@ impl<'a> NormNet<'a> {
         // TODO: also a sub method for save() and load()
 
         let g = self.scope.graph();
-        let session = Session::new(&self.session_options, &g)?;
         let mut run_args = SessionRunArgs::new();
 
         // set parameters to be optimization targets
@@ -790,7 +715,7 @@ impl<'a> NormNet<'a> {
         for var in &self.minimize_vars {
             run_args.add_target(&var.initializer());
         }
-        session.run(&mut run_args)?;
+        self.session.run(&mut run_args)?;
 
         //TODO: shouldnt need to initialize so much ITL
         //TODO: randomize input and labels and k-fold
@@ -836,7 +761,7 @@ impl<'a> NormNet<'a> {
             let error_squared_fetch = run_args.request_fetch(&self.Error, 0);
             run_args.add_feed(&self.Input, 0, &input_tensor);
             run_args.add_feed(&self.Label, 0, &label_tensor);
-            session.run(&mut run_args)?;
+            self.session.run(&mut run_args)?;
 
             let res: Tensor<f32> = run_args.fetch(error_squared_fetch)?;
 
@@ -851,9 +776,9 @@ impl<'a> NormNet<'a> {
 
         //TODO: save the model
         //if self.session is none save it
-        if self.session.is_none() {
-            self.session = Some(session);
-        }
+        // if self.session.is_none() {
+        // self.session = Some(session);
+        // }
         Ok(result)
     }
 }
@@ -932,7 +857,13 @@ mod tests {
         let mut e = std::path::PathBuf::new();
         for entry in fs::read_dir("test_serialized_models/").unwrap() {
             let entry = entry.unwrap();
-            e = entry.path();
+            let is_dir = entry.path();
+            //ensure e is a directory
+            if !is_dir.is_dir() {
+                continue;
+            } else {
+                e = is_dir;
+            }
             path = e.to_str().unwrap();
             println!("{:?}", path);
         }
@@ -941,7 +872,6 @@ mod tests {
 
         norm_net.load(path.to_string()).unwrap();
 
-        //TODO: delete everything in test_serialized_models
         //TODO: perform all operations and assert the parameters are the same
     }
 }
