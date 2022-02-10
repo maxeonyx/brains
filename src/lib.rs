@@ -23,6 +23,7 @@ use std::result::Result;
 //TODO: clean this up with proper heirachy
 use rand::Rng;
 use std::os;
+use std::rc::Rc;
 use tensorflow::ops;
 use tensorflow::train::AdadeltaOptimizer;
 use tensorflow::train::GradientDescentOptimizer;
@@ -102,7 +103,7 @@ pub fn norm_layer<O1: Into<Output>>(
     output_size: u64,
     activation: &dyn Fn(Output, &mut Scope) -> Result<Output, Status>,
     scope: &mut Scope,
-) -> Result<(Vec<Variable>, Output), Status> {
+) -> Result<(Vec<Variable>, Output, RefCell<Box<Operation>>), Status> {
     let mut scope = scope.new_sub_scope("layer");
     let scope = &mut scope;
     let w_shape = ops::constant(&[input_size as i64, output_size as i64][..], scope)?;
@@ -120,23 +121,25 @@ pub fn norm_layer<O1: Into<Output>>(
 
     //NOTE: tan on weights is to force weights to dropout but use the gradient for better dropout than random node based dropout
     //NOTE: we multiply the activation by 100 to represent values </>than 1/-1
+    let output_op = RefCell::new(Box::new(ops::div(
+        ops::mat_mul(
+            input,
+            //this sets the gradients to dropout weights
+            ops::tan(w.output().clone(), scope)?,
+            scope,
+        )?,
+        n,
+        scope,
+    )?));
+    let act_out = *output_op.borrow_mut().clone();
+
     let res = activation(
         //this normalizes to speed up trainning and sample efficiency
-        ops::div(
-            ops::mat_mul(
-                input,
-                //this sets the gradients to dropout weights
-                ops::tan(w.output().clone(), scope)?,
-                scope,
-            )?,
-            n,
-            scope,
-        )?
-        .into(),
+        act_out.into(),
         scope,
     )?
     .into(); //,
-    Ok((vec![w.clone()], res))
+    Ok((vec![w.clone()], res, output_op))
 }
 
 ///a normal layer as above but with residual connections
@@ -247,7 +250,7 @@ pub fn norm_net(
     let mut net_layers = vec![];
 
     //initial layer
-    let (vars, layer) = norm_layer(
+    let (vars, layer, _) = norm_layer(
         input.clone(),
         input_size,
         layer_width,
@@ -260,7 +263,7 @@ pub fn norm_net(
     let mut prev_layer = layer;
     //hidden layers
     for i in 0..layer_height - 2 {
-        let (vars, layer) = norm_layer(
+        let (vars, layer, _) = norm_layer(
             prev_layer.clone(),
             layer_width,
             layer_width,
@@ -276,7 +279,7 @@ pub fn norm_net(
 
     //the final output layer is tanh to express negative values and multiplied to stabilize the
     //half precision gradient as well as express whole integers outside of -1 and 1.
-    let (vars, output) = norm_layer(
+    let (vars, output, _) = norm_layer(
         net_layers.last().unwrap().clone(),
         layer_width,
         output_size,
@@ -297,24 +300,6 @@ pub fn norm_net(
     Ok((net_layers, net_vars, input, label, scope))
 }
 
-///organization struct to handle the paradigm for serialized sessions and graphs (feature disparity in Rust Tensorflow).
-struct Serialized {
-    //TODO: non-clonable shared reference movement
-    // SavedModel: SavedModelBundle,
-    session: Session,
-    graph: Graph,
-    // signature: &'a SignatureDef,
-    input_info: TensorInfo,
-    input: Operation,
-    output_info: TensorInfo,
-    output: Operation,
-    label_info: TensorInfo,
-    label: Operation,
-    error_info: TensorInfo,
-    error: Operation,
-    minimize_info: TensorInfo,
-    minimize: Operation,
-}
 //TODO: save and load from disk
 //TODO: does save/load require UUID? allow user to name in initialization for organization?
 //TODO: defaults such as learning rate
@@ -374,13 +359,12 @@ pub struct NormNet<'a> {
     //TODO: these may need to be refcell as well for saved model loader
     Input: Operation,
     Label: Operation,
-    Output: Output,
+    Output_op: Operation,
     Error: Operation,
     optimizer: AdadeltaOptimizer,
     minimize_vars: Vec<Variable>,
     minimize: Operation,
     SavedModelSaver: RefCell<Option<SavedModelSaver>>,
-    Serialized: Option<Serialized>,
 }
 impl<'a> NormNet<'a> {
     pub fn new(
@@ -411,7 +395,7 @@ impl<'a> NormNet<'a> {
         let mut net_layers = vec![];
 
         //initial layer
-        let (vars, layer) = norm_layer(
+        let (vars, layer, _) = norm_layer(
             Input.clone(),
             input_size,
             layer_width,
@@ -424,7 +408,7 @@ impl<'a> NormNet<'a> {
         let mut prev_layer = layer;
         //hidden layers
         for i in 0..layer_height - 2 {
-            let (vars, layer) = norm_layer(
+            let (vars, layer, _) = norm_layer(
                 prev_layer.clone(),
                 layer_width,
                 layer_width,
@@ -440,7 +424,7 @@ impl<'a> NormNet<'a> {
 
         //the final output layer is tanh to express negative values and multiplied to stabilize the
         //half precision gradient as well as express whole integers outside of -1 and 1.
-        let (vars, output) = norm_layer(
+        let (vars, output, Output_op) = norm_layer(
             net_layers.last().unwrap().clone(),
             layer_width,
             output_size,
@@ -459,6 +443,7 @@ impl<'a> NormNet<'a> {
         //END OF CONSTRUCTING NETWORK
 
         let Output = net_layers.last().unwrap().to_owned();
+        let Output_op = *Output_op.borrow().clone();
 
         let options = SessionOptions::new();
         let init_saved_model_saver = RefCell::new(None);
@@ -509,13 +494,12 @@ impl<'a> NormNet<'a> {
             net_vars,
             Input,
             Label,
-            Output,
+            Output_op,
             Error,
             optimizer,
             minimize_vars,
             minimize,
             SavedModelSaver: init_saved_model_saver,
-            Serialized: None,
         })
     }
 
@@ -538,6 +522,7 @@ impl<'a> NormNet<'a> {
             println!("initializing saved model saver..");
             let mut all_vars = self.net_vars.clone();
             all_vars.extend_from_slice(&self.minimize_vars);
+            let mut last_layer = self.net_layers.last().unwrap().clone();
             let mut builder = tensorflow::SavedModelBuilder::new();
             builder
                 .add_collection("train_vars", &all_vars)
@@ -590,10 +575,10 @@ impl<'a> NormNet<'a> {
                             },
                         ),
                     );
-                    def.add_output_info(
-                        REGRESS_OUTPUTS.to_string(),
-                        TensorInfo::new(DataType::Float, Shape::from(None), self.Output.name()?),
-                    );
+                    // def.add_output_info(
+                    //     REGRESS_OUTPUTS.to_string(),
+                    //     TensorInfo::new(DataType::Float, Shape::from(None), self.Output.name()?),
+                    // );
 
                     def
                 });
@@ -647,26 +632,40 @@ impl<'a> NormNet<'a> {
         // let minimize = graph.operation_by_name_required(&minimize_info.name().name)?;
         // let output = graph.operation_by_name_required(&output_info.name().name)?;
         // now associate the operations with the class state by creating Some(Serialized)
-        self.Serialized = Some(Serialized {
-            // SavedModel: bundle,
-            session: bundle.session,
-            // signature: &signature,
-            input_info: signature.get_input(REGRESS_INPUTS)?.clone(),
-            input: graph
-                .operation_by_name_required(&signature.get_input(REGRESS_INPUTS)?.name().name)?,
-            output_info: signature.get_output(REGRESS_OUTPUTS)?.clone(),
-            output: graph
-                .operation_by_name_required(&signature.get_output(REGRESS_OUTPUTS)?.name().name)?,
-            label_info: signature.get_input("label")?.clone(),
-            label: graph.operation_by_name_required(&signature.get_input("label")?.name().name)?,
-            error_info: signature.get_input("error")?.clone(),
-            error: graph.operation_by_name_required(&signature.get_input("error")?.name().name)?,
-            minimize_info: signature.get_input("minimize")?.clone(),
-            minimize: graph
-                .operation_by_name_required(&signature.get_input("minimize")?.name().name)?,
-            //NOTE: shouldnt need to interact with the graph after this, ablate this due to abstraction once tested
-            graph: graph,
-        });
+
+        //TODO: restore this if we cant move graph
+        // self.Serialized = Some(Serialized {
+        //     // SavedModel: bundle,
+        //     session: bundle.session,
+        //     // signature: &signature,
+        //     input_info: signature.get_input(REGRESS_INPUTS)?.clone(),
+        //     input: graph
+        //         .operation_by_name_required(&signature.get_input(REGRESS_INPUTS)?.name().name)?,
+        //     output_info: signature.get_output(REGRESS_OUTPUTS)?.clone(),
+        //     output: graph
+        //         .operation_by_name_required(&signature.get_output(REGRESS_OUTPUTS)?.name().name)?,
+        //     label_info: signature.get_input("label")?.clone(),
+        //     label: graph.operation_by_name_required(&signature.get_input("label")?.name().name)?,
+        //     error_info: signature.get_input("error")?.clone(),
+        //     error: graph.operation_by_name_required(&signature.get_input("error")?.name().name)?,
+        //     minimize_info: signature.get_input("minimize")?.clone(),
+        //     minimize: graph
+        //         .operation_by_name_required(&signature.get_input("minimize")?.name().name)?,
+        //     //NOTE: shouldnt need to interact with the graph after this, ablate this due to abstraction once tested
+        //     graph: graph,
+        // });
+        //TODO: update NormNet parameters as much as possible with the loaded values (can we deprecate Serialized struct?)
+        self.session = bundle.session;
+        self.Input =
+            graph.operation_by_name_required(&signature.get_input(REGRESS_INPUTS)?.name().name)?;
+        self.Label =
+            graph.operation_by_name_required(&signature.get_input("label")?.name().name)?;
+        self.Error =
+            graph.operation_by_name_required(&signature.get_input("error")?.name().name)?;
+        self.minimize =
+            graph.operation_by_name_required(&signature.get_input("minimize")?.name().name)?;
+        let output_info = signature.get_output(REGRESS_OUTPUTS)?;
+
         // set the variables to be the loaded variables
         Ok(())
     }
@@ -717,7 +716,6 @@ impl<'a> NormNet<'a> {
         }
         self.session.run(&mut run_args)?;
 
-        //TODO: shouldnt need to initialize so much ITL
         //TODO: randomize input and labels and k-fold
         //TODO: create dataset structure
         println!("trainning..");
@@ -759,26 +757,23 @@ impl<'a> NormNet<'a> {
             run_args.add_target(&self.minimize);
 
             let error_squared_fetch = run_args.request_fetch(&self.Error, 0);
+            let output = run_args.request_fetch(&self.Output_op, 0);
             run_args.add_feed(&self.Input, 0, &input_tensor);
             run_args.add_feed(&self.Label, 0, &label_tensor);
             self.session.run(&mut run_args)?;
 
             let res: Tensor<f32> = run_args.fetch(error_squared_fetch)?;
+            let output: Tensor<T> = run_args.fetch(output)?;
 
             // do the above prints in one line
             println!(
-                "training on {}\n input: {:?} label: {:?} error: {}",
-                i, input, label, res
+                "training on {}\n input: {:?} label: {:?} error: {} output: {}",
+                i, input, label, res, output,
             );
 
             result.push(res);
         }
 
-        //TODO: save the model
-        //if self.session is none save it
-        // if self.session.is_none() {
-        // self.session = Some(session);
-        // }
         Ok(result)
     }
 }
