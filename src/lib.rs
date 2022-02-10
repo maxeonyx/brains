@@ -53,6 +53,9 @@ use tensorflow::REGRESS_METHOD_NAME;
 use tensorflow::REGRESS_OUTPUTS;
 use uuid::Uuid;
 
+//TODO: this may be able to be abstracted into a high level NN crate that allows architecture development by
+//      passing layer in functionally then using the high level abstractions of NormNet (rename to ANN or something)
+
 /// A standard fully connected layer with bias term
 ///
 /// `activation` is a function which takes a tensor and applies an activation
@@ -598,7 +601,7 @@ impl<'a> NormNet<'a> {
     }
 
     ///load the model from disk and store it in self.Serialized
-    pub fn load(&'a mut self, dir: String) -> Result<(), Box<dyn Error>> {
+    pub fn load(&mut self, dir: String) -> Result<(), Box<dyn Error>> {
         // load the model from disk in the current directory
         println!("loading previously saved model..");
         //TODO: check examples in tensorflow rust for solution:
@@ -789,8 +792,7 @@ mod tests {
         //CONSTRUCTION//
         let mut scope = Scope::new_root_scope();
         //TODO: once session is in constructor remove the optionals and this
-        let mut norm_net =
-            NormNet::new(&mut scope, 2, 1, 10, 10, 10, 0.0000000000001, 5 as f32).unwrap();
+        let mut norm_net = NormNet::new(&mut scope, 2, 1, 10, 10, 10, 10.0, 5 as f32).unwrap();
 
         //FITNESS FUNCTION//
         //TODO: pass in dyn fitness function instead of hardcoded in class?
@@ -822,8 +824,7 @@ mod tests {
 
         //CONSTRUCTION//
         let mut scope = Scope::new_root_scope();
-        let mut norm_net =
-            NormNet::new(&mut scope, 2, 1, 10, 10, 10, 0.0000000000001, 5 as f32).unwrap();
+        let mut norm_net = NormNet::new(&mut scope, 2, 1, 10, 10, 10, 10.0, 5 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
         let mut inputs = Vec::new();
@@ -839,7 +840,7 @@ mod tests {
         }
 
         assert_eq!(inputs.len(), outputs.len());
-        norm_net.train(inputs, outputs).unwrap();
+        norm_net.train(inputs.clone(), outputs.clone()).unwrap();
 
         // save the network
         norm_net
@@ -868,5 +869,6 @@ mod tests {
         norm_net.load(path.to_string()).unwrap();
 
         //TODO: perform all operations and assert the parameters are the same
+        norm_net.train(inputs, outputs).unwrap();
     }
 }
