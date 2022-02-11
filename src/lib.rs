@@ -24,6 +24,7 @@ use std::result::Result;
 use rand::Rng;
 use std::os;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 use tensorflow::ops;
 use tensorflow::train::AdadeltaOptimizer;
 use tensorflow::train::GradientDescentOptimizer;
@@ -55,6 +56,7 @@ use uuid::Uuid;
 
 //TODO: this may be able to be abstracted into a high level NN crate that allows architecture development by
 //      passing layer in functionally then using the high level abstractions of NormNet (rename to ANN or something)
+//      build a seperate library of network architectures like tf.NN
 
 /// A standard fully connected layer with bias term
 ///
@@ -104,9 +106,9 @@ pub fn norm_layer<O1: Into<Output>>(
     input: O1,
     input_size: u64,
     output_size: u64,
-    activation: &dyn Fn(Output, &mut Scope) -> Result<Output, Status>,
+    activation: &dyn Fn(Output, &mut Scope) -> Result<Operation, Status>,
     scope: &mut Scope,
-) -> Result<(Vec<Variable>, Output, RefCell<Box<Operation>>), Status> {
+) -> Result<(Vec<Variable>, Output, Operation), Status> {
     let mut scope = scope.new_sub_scope("layer");
     let scope = &mut scope;
     let w_shape = ops::constant(&[input_size as i64, output_size as i64][..], scope)?;
@@ -124,7 +126,7 @@ pub fn norm_layer<O1: Into<Output>>(
 
     //NOTE: tan on weights is to force weights to dropout but use the gradient for better dropout than random node based dropout
     //NOTE: we multiply the activation by 100 to represent values </>than 1/-1
-    let output_op = RefCell::new(Box::new(ops::div(
+    let output_op = ops::div(
         ops::mat_mul(
             input,
             //this sets the gradients to dropout weights
@@ -133,16 +135,16 @@ pub fn norm_layer<O1: Into<Output>>(
         )?,
         n,
         scope,
-    )?));
-    let act_out = *output_op.borrow_mut().clone();
+    )?;
 
-    let res = activation(
+    let act = activation(
         //this normalizes to speed up trainning and sample efficiency
-        act_out.into(),
+        output_op.into(),
         scope,
-    )?
-    .into(); //,
-    Ok((vec![w.clone()], res, output_op))
+    )?;
+    let output_op = act.clone();
+    // .into(); //,
+    Ok((vec![w.clone()], act.into(), output_op))
 }
 
 ///a normal layer as above but with residual connections
@@ -348,9 +350,9 @@ pub fn norm_net(
 /// In all other operations we are strictly bounded -1 > x > 1. As long as layer_width is not
 /// greater than Float range we are fine in the worst case (summing all 1's).
 /// Otherwise decimal precision of float type is our parameter type precision.
-pub struct NormNet<'a> {
+pub struct NormNet {
     ///the scope for tensorflow to prevent having multiple scopes active
-    scope: &'a mut Scope,
+    scope: Scope,
     ///Session options currently being used
     session: Session,
     session_options: SessionOptions,
@@ -364,15 +366,18 @@ pub struct NormNet<'a> {
     Label: Operation,
     Output_op: Operation,
     Error: Operation,
-    optimizer: AdadeltaOptimizer,
+    // optimizer: AdadeltaOptimizer,
+    optimizer: GradientDescentOptimizer,
     minimize_vars: Vec<Variable>,
     minimize: Operation,
     SavedModelSaver: RefCell<Option<SavedModelSaver>>,
     is_loaded: bool,
 }
-impl<'a> NormNet<'a> {
+impl NormNet {
     pub fn new(
-        scope: &'a mut Scope,
+        //TODO: alternate constructor to allow complete abstraction from tensorflow
+        //      session (also need build script for CPU/GPU). User only needs to
+        //      operate with Rust std type (vec f32 etc.)
         input_size: u64,
         output_size: u64,
         layer_width: u64,
@@ -382,7 +387,8 @@ impl<'a> NormNet<'a> {
         //a power to raise the pythagorean distance error to for gradient scaling error_
         error_power: f32,
     ) -> Result<NormNet, Status> {
-        assert!(max_integer % 10 == 0, "max_integer must be a multiple of 10 since it represents order of magnitude of the integer range");
+        assert!(max_integer % 10 == 0 || max_integer == 1, "max_integer must be a multiple of 10 since it represents order of magnitude of the integer range");
+        let mut scope = Scope::new_root_scope();
 
         // TODO: consider inlining this since were encapsulating
         let Input = ops::Placeholder::new()
@@ -404,7 +410,7 @@ impl<'a> NormNet<'a> {
             input_size,
             layer_width,
             &|x, scope| Ok(ops::tanh(x, scope)?.into()),
-            scope,
+            &mut scope,
         )?;
         net_vars.extend(vars);
         net_layers.push(layer.clone());
@@ -418,7 +424,7 @@ impl<'a> NormNet<'a> {
                 layer_width,
                 //NOTE: originally designed with tan but vanishing gradient can occur
                 &|x, scope| Ok(ops::tanh(x, scope)?.into()),
-                scope,
+                &mut scope,
             )?;
             prev_layer = layer.clone();
 
@@ -440,21 +446,23 @@ impl<'a> NormNet<'a> {
                 )?
                 .into())
             },
-            scope,
+            &mut scope,
         )?;
         net_vars.extend(vars);
-        net_layers.push(output);
+        net_layers.push(output.clone());
         //END OF CONSTRUCTING NETWORK
 
-        let Output = net_layers.last().unwrap().to_owned();
-        let Output_op = *Output_op.borrow().clone();
+        // let Output = net_layers.last().unwrap().to_owned();
+        let Output = output;
 
         let options = SessionOptions::new();
         let init_saved_model_saver = RefCell::new(None);
 
         //TODO: this needs to be in state so that it can be saved for transfer learning
-        let mut optimizer = AdadeltaOptimizer::new();
-        optimizer.set_learning_rate(ops::constant(learning_rate, scope)?);
+        // let mut optimizer = AdadeltaOptimizer::new();
+        let mut optimizer =
+            GradientDescentOptimizer::new(ops::constant(learning_rate, &mut scope)?);
+        // optimizer.set_learning_rate(ops::constant(learning_rate, &mut scope)?);
 
         // DEFINE ERROR FUNCTION //
         //TODO: pass this in conditionally, give user output and label with
@@ -463,23 +471,24 @@ impl<'a> NormNet<'a> {
         //default error is pythagorean distance
         let Error = ops::sqrt(
             ops::pow(
-                ops::sub(Output.clone(), Label.clone(), scope)?,
-                ops::constant(2.0 as f32, scope)?,
-                scope,
+                ops::sub(Output.clone(), Label.clone(), &mut scope)?,
+                ops::constant(2.0 as f32, &mut scope)?,
+                &mut scope,
             )?,
-            scope,
+            &mut scope,
         )?;
         //TODO: at least pass in the constant here as a gradient weighting scalar coefficient
+        //TODO: scalar coeffecient instead to prevent curving the gradient
         let Error = ops::pow(
             Error.clone(),
-            ops::constant(error_power, scope).unwrap(),
+            ops::constant(error_power, &mut scope).unwrap(),
             &mut scope.with_op_name("error"),
         )
         .unwrap();
 
         let (minimize_vars, minimize) = optimizer
             .minimize(
-                scope,
+                &mut scope,
                 Error.clone().into(),
                 MinimizeOptions::default().with_variables(&net_vars),
             )?
@@ -587,7 +596,7 @@ impl<'a> NormNet<'a> {
 
                     def
                 });
-            let saved_model_saver = builder.inject(self.scope)?;
+            let saved_model_saver = builder.inject(&mut self.scope)?;
             self.SavedModelSaver.replace(Some(saved_model_saver));
         }
         // generate a uuid
@@ -604,62 +613,17 @@ impl<'a> NormNet<'a> {
 
     ///load the model from disk and store it in self.Serialized
     pub fn load(&mut self, dir: String) -> Result<(), Box<dyn Error>> {
-        // load the model from disk in the current directory
+        // load the model from disk in the given directory
         println!("loading previously saved model..");
-        //TODO: check examples in tensorflow rust for solution:
-        // load the model from the saved model saver for this training session
-        // let save_dir = std::env::current_dir().unwrap();
         let mut graph = Graph::new();
         //TODO: ensure we can access variables from graph or otherwise
-        let bundle = SavedModelBundle::load(
-            //TODO: test here that this overwrites correctly
-            // &SessionOptions::new(),
-            &self.session_options,
-            &["serve", "train"],
-            &mut graph,
-            dir,
-        )?;
-        //TODO: associate the operations with the class state
-        // let session = &bundle.session;
+        let bundle =
+            SavedModelBundle::load(&self.session_options, &["serve", "train"], &mut graph, dir)?;
         let signature = bundle
             .meta_graph_def()
             .get_signature(REGRESS_METHOD_NAME)?
             .clone();
-        //TODO: ensure cloning the bits in the construction below retains the proper graph pointers
-        // let input_info = signature.get_input(REGRESS_INPUTS)?;
-        // let label_info = signature.get_input("label")?;
-        // let error_info = signature.get_input("error")?;
-        // let minimize_info = signature.get_input("minimize")?;
-        // let output_info = signature.get_output(REGRESS_OUTPUTS)?;
-        // let input = graph.operation_by_name_required(&input_info.name().name)?;
-        // let label = graph.operation_by_name_required(&label_info.name().name)?;
-        // let error = graph.operation_by_name_required(&error_info.name().name)?;
-        // let minimize = graph.operation_by_name_required(&minimize_info.name().name)?;
-        // let output = graph.operation_by_name_required(&output_info.name().name)?;
-        // now associate the operations with the class state by creating Some(Serialized)
 
-        //TODO: restore this if we cant move graph
-        // self.Serialized = Some(Serialized {
-        //     // SavedModel: bundle,
-        //     session: bundle.session,
-        //     // signature: &signature,
-        //     input_info: signature.get_input(REGRESS_INPUTS)?.clone(),
-        //     input: graph
-        //         .operation_by_name_required(&signature.get_input(REGRESS_INPUTS)?.name().name)?,
-        //     output_info: signature.get_output(REGRESS_OUTPUTS)?.clone(),
-        //     output: graph
-        //         .operation_by_name_required(&signature.get_output(REGRESS_OUTPUTS)?.name().name)?,
-        //     label_info: signature.get_input("label")?.clone(),
-        //     label: graph.operation_by_name_required(&signature.get_input("label")?.name().name)?,
-        //     error_info: signature.get_input("error")?.clone(),
-        //     error: graph.operation_by_name_required(&signature.get_input("error")?.name().name)?,
-        //     minimize_info: signature.get_input("minimize")?.clone(),
-        //     minimize: graph
-        //         .operation_by_name_required(&signature.get_input("minimize")?.name().name)?,
-        //     //NOTE: shouldnt need to interact with the graph after this, ablate this due to abstraction once tested
-        //     graph: graph,
-        // });
-        //TODO: update NormNet parameters as much as possible with the loaded values (can we deprecate Serialized struct?)
         self.session = bundle.session;
         self.Input =
             graph.operation_by_name_required(&signature.get_input("inputs")?.name().name)?;
@@ -670,24 +634,10 @@ impl<'a> NormNet<'a> {
         self.minimize =
             graph.operation_by_name_required(&signature.get_input("minimize")?.name().name)?;
 
-        // set the variables to be the loaded variables
+        // TODO: @DEPRECATED with construction var initialization
         self.is_loaded = true;
         Ok(())
     }
-    ///TODO: pub fn serialize(self, uuid) // serialize NormNet including the session-graph to disk
-
-    //TODO:
-    ///train the network with theGiven inputs and labelswhich must be
-    /// synchronized in index order initializes a saved model saver if not already initialized and saves after training.
-    // pub fn train_checkpoint<T: tensorflow::TensorType>(
-    //     self,
-    //     inputs: Vec<Vec<T>>,
-    //     labels: Vec<Vec<T>>,
-    //     // TODO: pass these is instead of constructing
-    //     // error: Operation,
-    //     // learning_rate: f32,
-    // ) -> Result<Vec<Tensor<f32>>, Status> {
-    // }
 
     /// train the network with the given inputs and labels (must be synchronized in index order)
     ///PARAMETERS:
@@ -700,18 +650,14 @@ impl<'a> NormNet<'a> {
         &mut self,
         inputs: Vec<Vec<T>>,
         labels: Vec<Vec<T>>,
-        // TODO: pass these is instead of constructing
+        // TODO: extract from class: pass these is instead of constructing
         // error: Operation,
         // learning_rate: f32,
     ) -> Result<Vec<Tensor<f32>>, Status> {
-        //TODO: allow to change learning rate and error here
-        // load the model if it has been saved otherwise initialize a saved model saver
-        //TODO: extract this so we can call it in other training methods as a "refresh" serialization synchronization
-        // TODO: also a sub method for save() and load()
-
         let mut run_args = SessionRunArgs::new();
 
-        // set parameters to be optimization targets
+        // set parameters to be optimization targets if they havent been set already
+        //TODO: this should be in constructor with a one time sessionargs run
         if !self.is_loaded {
             for var in &self.net_vars {
                 run_args.add_target(&var.initializer());
@@ -720,28 +666,28 @@ impl<'a> NormNet<'a> {
                 run_args.add_target(&var.initializer());
             }
             self.session.run(&mut run_args)?;
-        } else {
         }
-        //TODO: add minimize here
 
-        //TODO: randomize input and labels and k-fold
-        //TODO: create dataset structure
+        //TODO: randomize input and labels while k-folding
         println!("trainning..");
         let mut result = vec![];
 
         let mut input_tensor: Tensor<T> = Tensor::new(&[1u64, inputs[0].len() as u64]);
-        // print inputs[0].len();
+        let mut label_tensor: Tensor<T> = Tensor::new(&[1u64, labels[0].len() as u64]);
+
         println!("inputs.len(): {}", inputs.len());
         println!("{}", inputs[0].len());
-        let mut label_tensor: Tensor<T> = Tensor::new(&[1u64, labels[0].len() as u64]);
         println!("{}", labels[0].len());
-        // let layer5_output_fetch = run_args.request_fetch(&layer1_output, 0);
+
         let mut input_iter = inputs.into_iter();
         let mut label_iter = labels.into_iter();
         input_iter.next();
         label_iter.next();
         let mut i = 0;
         loop {
+            // start a timer
+            let start = Instant::now();
+
             i += 1;
             let input = input_iter.next();
             let label = label_iter.next();
@@ -773,10 +719,16 @@ impl<'a> NormNet<'a> {
             let res: Tensor<f32> = run_args.fetch(error_squared_fetch)?;
             let output: Tensor<T> = run_args.fetch(output)?;
 
-            // do the above prints in one line
+            // get how long has passed
+            let elapsed = start.elapsed();
+            // println!(
+            //     "training on {}\n input: {:?} label: {:?} error: {} output: {}",
+            //     i, input, label, res, output,
+            // );
+            // also print elapsed time
             println!(
-                "training on {}\n input: {:?} label: {:?} error: {} output: {}",
-                i, input, label, res, output,
+                "training on {}\n input: {:?} label: {:?} error: {} output: {} elapsed: {:?}",
+                i, input, label, res, output, elapsed
             );
 
             result.push(res);
@@ -796,11 +748,10 @@ mod tests {
 
         //CONSTRUCTION//
         let mut scope = Scope::new_root_scope();
-        //TODO: once session is in constructor remove the optionals and this
-        let mut norm_net = NormNet::new(&mut scope, 2, 1, 10, 10, 10, 10.0, 5 as f32).unwrap();
+        let mut norm_net = NormNet::new(2, 1, 10, 10, 10, 10.0, 5 as f32).unwrap();
 
         //FITNESS FUNCTION//
-        //TODO: pass in dyn fitness function instead of hardcoded in class?
+        //TODO: auto gen labels from outputs and fitness function.
 
         //TRAIN//
         let mut rrng = rand::thread_rng();
@@ -829,7 +780,7 @@ mod tests {
 
         //CONSTRUCTION//
         let mut scope = Scope::new_root_scope();
-        let mut norm_net = NormNet::new(&mut scope, 2, 1, 10, 10, 10, 10.0, 5 as f32).unwrap();
+        let mut norm_net = NormNet::new(2, 1, 20, 15, 10, 0.1, 10 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
         let mut inputs = Vec::new();
