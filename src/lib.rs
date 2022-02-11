@@ -368,6 +368,7 @@ pub struct NormNet<'a> {
     minimize_vars: Vec<Variable>,
     minimize: Operation,
     SavedModelSaver: RefCell<Option<SavedModelSaver>>,
+    is_loaded: bool,
 }
 impl<'a> NormNet<'a> {
     pub fn new(
@@ -503,6 +504,7 @@ impl<'a> NormNet<'a> {
             minimize_vars,
             minimize,
             SavedModelSaver: init_saved_model_saver,
+            is_loaded: false,
         })
     }
 
@@ -528,7 +530,7 @@ impl<'a> NormNet<'a> {
             let mut last_layer = self.net_layers.last().unwrap().clone();
             let mut builder = tensorflow::SavedModelBuilder::new();
             builder
-                .add_collection("train_vars", &all_vars)
+                .add_collection("train", &all_vars)
                 .add_tag("serve")
                 .add_tag("train")
                 .add_signature(REGRESS_METHOD_NAME, {
@@ -660,16 +662,16 @@ impl<'a> NormNet<'a> {
         //TODO: update NormNet parameters as much as possible with the loaded values (can we deprecate Serialized struct?)
         self.session = bundle.session;
         self.Input =
-            graph.operation_by_name_required(&signature.get_input(REGRESS_INPUTS)?.name().name)?;
+            graph.operation_by_name_required(&signature.get_input("inputs")?.name().name)?;
         self.Label =
             graph.operation_by_name_required(&signature.get_input("label")?.name().name)?;
         self.Error =
             graph.operation_by_name_required(&signature.get_input("error")?.name().name)?;
         self.minimize =
             graph.operation_by_name_required(&signature.get_input("minimize")?.name().name)?;
-        let output_info = signature.get_output(REGRESS_OUTPUTS)?;
 
         // set the variables to be the loaded variables
+        self.is_loaded = true;
         Ok(())
     }
     ///TODO: pub fn serialize(self, uuid) // serialize NormNet including the session-graph to disk
@@ -707,17 +709,20 @@ impl<'a> NormNet<'a> {
         //TODO: extract this so we can call it in other training methods as a "refresh" serialization synchronization
         // TODO: also a sub method for save() and load()
 
-        let g = self.scope.graph();
         let mut run_args = SessionRunArgs::new();
 
         // set parameters to be optimization targets
-        for var in &self.net_vars {
-            run_args.add_target(&var.initializer());
+        if !self.is_loaded {
+            for var in &self.net_vars {
+                run_args.add_target(&var.initializer());
+            }
+            for var in &self.minimize_vars {
+                run_args.add_target(&var.initializer());
+            }
+            self.session.run(&mut run_args)?;
+        } else {
         }
-        for var in &self.minimize_vars {
-            run_args.add_target(&var.initializer());
-        }
-        self.session.run(&mut run_args)?;
+        //TODO: add minimize here
 
         //TODO: randomize input and labels and k-fold
         //TODO: create dataset structure
@@ -830,7 +835,7 @@ mod tests {
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
         // create 100 entries for inputs and outputs of xor
-        for _ in 0..10 {
+        for _ in 0..700 {
             // instead of the above, generate either 0 or 1 and cast to f32
             let input = vec![(rrng.gen::<u8>() & 1) as f32, (rrng.gen::<u8>() & 1) as f32];
             let output = vec![(input[0] as u8 ^ input[1] as u8) as f32];
