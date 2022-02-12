@@ -351,43 +351,38 @@ pub fn norm_net(
 /// greater than Float range we are fine in the worst case (summing all 1's).
 /// Otherwise decimal precision of float type is our parameter type precision.
 pub struct NormNet {
-    ///the scope for tensorflow to prevent having multiple scopes active
+    /// Tensorflow objects for user abstraction from Tensorflow
     scope: Scope,
-    ///Session options currently being used
     session: Session,
     session_options: SessionOptions,
-    // graph: Option<Graph>,
-    ///each layers output hook of the network
+    ///each layers output for the network
     net_layers: Vec<Output>,
-    ///all the parameters of the network
+    ///all the trainable parameters of the network
     net_vars: Vec<Variable>,
-    //TODO: these may need to be refcell as well for saved model loader
+    ///Operations to interact with the graph (kept here for serialization)
     Input: Operation,
     Label: Operation,
     Output_op: Operation,
     Error: Operation,
-    // optimizer: AdadeltaOptimizer,
-    optimizer: GradientDescentOptimizer,
+    ///variables to be minimized
     minimize_vars: Vec<Variable>,
+    ///regression operation
     minimize: Operation,
+    ///class for serializing, saving and loading the model
     SavedModelSaver: RefCell<Option<SavedModelSaver>>,
     is_loaded: bool,
 }
 impl NormNet {
     pub fn new(
-        //TODO: alternate constructor to allow complete abstraction from tensorflow
-        //      session (also need build script for CPU/GPU). User only needs to
-        //      operate with Rust std type (vec f32 etc.)
         input_size: u64,
         output_size: u64,
         layer_width: u64,
         layer_height: u64,
         max_integer: u32,
         learning_rate: f32,
-        //a power to raise the pythagorean distance error to for gradient scaling error_
         error_power: f32,
     ) -> Result<NormNet, Status> {
-        assert!(max_integer % 10 == 0 || max_integer == 1, "max_integer must be a multiple of 10 since it represents order of magnitude of the integer range");
+        assert!(max_integer % 10 == 0 || max_integer == 1, "max_integer must be a multiple of 10 or 1 since it represents order of magnitude of the integer range");
         let mut scope = Scope::new_root_scope();
 
         // TODO: consider inlining this since were encapsulating
@@ -459,10 +454,10 @@ impl NormNet {
         let init_saved_model_saver = RefCell::new(None);
 
         //TODO: this needs to be in state so that it can be saved for transfer learning
-        // let mut optimizer = AdadeltaOptimizer::new();
+        //  let mut optimizer = AdadeltaOptimizer::new();
+        //  optimizer.set_learning_rate(ops::constant(learning_rate, &mut scope)?);
         let mut optimizer =
             GradientDescentOptimizer::new(ops::constant(learning_rate, &mut scope)?);
-        // optimizer.set_learning_rate(ops::constant(learning_rate, &mut scope)?);
 
         // DEFINE ERROR FUNCTION //
         //TODO: pass this in conditionally, give user output and label with
@@ -495,21 +490,27 @@ impl NormNet {
             .into();
         let session = Session::new(&options, &mut scope.graph())?;
 
-        // TODO: initialize session and graph here?
+        // set parameters to be optimization targets if they havent been set already
+        let mut run_args = SessionRunArgs::new();
+        //TODO: This is a strange way to initialize variables
+        for var in &net_vars {
+            run_args.add_target(&var.initializer());
+        }
+        for var in &minimize_vars {
+            run_args.add_target(&var.initializer());
+        }
+        session.run(&mut run_args)?;
 
         Ok(NormNet {
             scope,
             session: session,
             session_options: options,
-            //TODO: does this need to be declared or can we always self.scope.graph()? may conflict if user is using scope for other things
-            // graph: None,
             net_layers,
             net_vars,
             Input,
             Label,
             Output_op,
             Error,
-            optimizer,
             minimize_vars,
             minimize,
             SavedModelSaver: init_saved_model_saver,
@@ -599,6 +600,7 @@ impl NormNet {
             let saved_model_saver = builder.inject(&mut self.scope)?;
             self.SavedModelSaver.replace(Some(saved_model_saver));
         }
+        //TODO: annotate this with user input, fitness and checkpoint number
         // generate a uuid
         let uuid = Uuid::new_v4();
         self.SavedModelSaver.borrow_mut().as_mut().unwrap().save(
@@ -656,17 +658,6 @@ impl NormNet {
     ) -> Result<Vec<Tensor<f32>>, Status> {
         let mut run_args = SessionRunArgs::new();
 
-        // set parameters to be optimization targets if they havent been set already
-        //TODO: this should be in constructor with a one time sessionargs run
-        if !self.is_loaded {
-            for var in &self.net_vars {
-                run_args.add_target(&var.initializer());
-            }
-            for var in &self.minimize_vars {
-                run_args.add_target(&var.initializer());
-            }
-            self.session.run(&mut run_args)?;
-        }
 
         //TODO: randomize input and labels while k-folding
         println!("trainning..");
@@ -684,6 +675,7 @@ impl NormNet {
         input_iter.next();
         label_iter.next();
         let mut i = 0;
+        let mut avg_t = vec![];
         loop {
             // start a timer
             let start = Instant::now();
@@ -721,14 +713,14 @@ impl NormNet {
 
             // get how long has passed
             let elapsed = start.elapsed();
-            // println!(
-            //     "training on {}\n input: {:?} label: {:?} error: {} output: {}",
-            //     i, input, label, res, output,
-            // );
-            // also print elapsed time
+            avg_t.push(elapsed.as_secs_f32());
+
+            // update the moving average for time
+            let average = avg_t.iter().sum::<f32>() / avg_t.len() as f32;
+
             println!(
-                "training on {}\n input: {:?} label: {:?} error: {} output: {} elapsed: {:?}",
-                i, input, label, res, output, elapsed
+                "training on {}\n input: {:?} label: {:?} error: {} output: {} time/epoch(ms): {:?}",
+                i, input, label, res, output,average 
             );
 
             result.push(res);
@@ -780,7 +772,7 @@ mod tests {
 
         //CONSTRUCTION//
         let mut scope = Scope::new_root_scope();
-        let mut norm_net = NormNet::new(2, 1, 20, 15, 10, 0.1, 10 as f32).unwrap();
+        let mut norm_net = NormNet::new(2, 1, 20, 15, 10, 0.01, 5 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
         let mut inputs = Vec::new();
