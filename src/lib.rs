@@ -57,6 +57,10 @@ use uuid::Uuid;
 //TODO: this may be able to be abstracted into a high level NN crate that allows architecture development by
 //      passing layer in functionally then using the high level abstractions of NormNet (rename to ANN or something)
 //      build a seperate library of network architectures like tf.NN
+//TODO: extract layers to layers.rs
+
+//TODO: type errors for anything other than u64 architecture due to casts. 
+//      Also type errors for summing f32s which should accumulated to f64.
 
 /// A standard fully connected layer with bias term
 ///
@@ -350,7 +354,9 @@ pub fn norm_net(
 /// In all other operations we are strictly bounded -1 > x > 1. As long as layer_width is not
 /// greater than Float range we are fine in the worst case (summing all 1's).
 /// Otherwise decimal precision of float type is our parameter type precision.
-pub struct NormNet {
+pub struct NormNet<'a> {
+    //TODO: this is getting rather large, how can this be refactored? functionally?
+    //TODO: checkpoint based stuff is a meta-learner, consider refactoring to a seperate object for organization
     /// Tensorflow objects for user abstraction from Tensorflow
     scope: Scope,
     session: Session,
@@ -370,18 +376,32 @@ pub struct NormNet {
     minimize: Operation,
     ///class for serializing, saving and loading the model
     SavedModelSaver: RefCell<Option<SavedModelSaver>>,
-    is_loaded: bool,
+    ///user specified name of this model
+    name: &'a str,
+    ///the current checkpoint count
+    checkpoint_count: u64,
+    ///the highest score achieved (lowest error) as a sum of the error vector. 
+    ///initialized to -1 since error can never be negative.
+    lowest_error: f32,
+    ///the size of the moving average for the lowest error
+    evaluation_window_size: u64,
+    ///the moving average window of labels trained on before the score is evaluated
+    evaluation_window: Vec<f32>,
 }
-impl NormNet {
+impl <'a>NormNet <'a>{
+    //TODO: type safety: some of the meta-learning values should be 64 bit for overflow since we sum 32s etc.
     pub fn new(
+        name: &'a str,
         input_size: u64,
         output_size: u64,
         layer_width: u64,
         layer_height: u64,
         max_integer: u32,
         learning_rate: f32,
+        evaluation_window_size: u64,
+        // evaluation_window: Vec<f32>,
         error_power: f32,
-    ) -> Result<NormNet, Status> {
+    ) -> Result<NormNet<'a>, Status> {
         assert!(max_integer % 10 == 0 || max_integer == 1, "max_integer must be a multiple of 10 or 1 since it represents order of magnitude of the integer range");
         let mut scope = Scope::new_root_scope();
 
@@ -447,13 +467,12 @@ impl NormNet {
         net_layers.push(output.clone());
         //END OF CONSTRUCTING NETWORK
 
-        // let Output = net_layers.last().unwrap().to_owned();
         let Output = output;
 
         let options = SessionOptions::new();
-        let init_saved_model_saver = RefCell::new(None);
+        let SavedModelSaver= RefCell::new(None);
 
-        //TODO: this needs to be in state so that it can be saved for transfer learning
+        //TODO: pass this in? this should be modular so new implementations can be tried
         //  let mut optimizer = AdadeltaOptimizer::new();
         //  optimizer.set_learning_rate(ops::constant(learning_rate, &mut scope)?);
         let mut optimizer =
@@ -462,7 +481,8 @@ impl NormNet {
         // DEFINE ERROR FUNCTION //
         //TODO: pass this in conditionally, give user output and label with
         //      a partial constructor then they supply error and construction is complete
-        // two structs? whats standard functionally for partial construction?
+        //      two structs? whats standard functionally for partial construction?
+
         //default error is pythagorean distance
         let Error = ops::sqrt(
             ops::pow(
@@ -478,8 +498,10 @@ impl NormNet {
             Error.clone(),
             ops::constant(error_power, &mut scope).unwrap(),
             &mut scope.with_op_name("error"),
-        )
-        .unwrap();
+        )?;
+
+        let mut lowest_error = -1.0 as f32;
+        let mut evaluation_window = vec![];
 
         let (minimize_vars, minimize) = optimizer
             .minimize(
@@ -502,6 +524,7 @@ impl NormNet {
         session.run(&mut run_args)?;
 
         Ok(NormNet {
+            name,
             scope,
             session: session,
             session_options: options,
@@ -513,8 +536,11 @@ impl NormNet {
             Error,
             minimize_vars,
             minimize,
-            SavedModelSaver: init_saved_model_saver,
-            is_loaded: false,
+            SavedModelSaver,
+            lowest_error,
+            evaluation_window,
+            evaluation_window_size,
+            checkpoint_count: 0,
         })
     }
 
@@ -523,21 +549,43 @@ impl NormNet {
     //one time traning that can take output of infer and a label
     // fn backprop
 
+    /// stores the error in self.lowest error if it is lower than the current lowest 
+    /// error and returns true otherwise returns false and accumulates the error for the moving average.
+    fn register_error(&mut self, error: Tensor<f32>) -> bool{
+        let mut result = false;
+
+        let error_sum = error.iter().fold(0.0, |acc, x| acc + x);
+        self.evaluation_window.push(error_sum);
+
+        println!("error sum: {}", error_sum);
+        println!("lowest error: {}", self.lowest_error);
+
+        if self.evaluation_window.len() >= self.evaluation_window_size as usize {
+            println!("evaluation window is full");
+            // average evaluation_window (dont need to divide since always comparing this value relatively)
+            let avg = self.evaluation_window.iter().fold(0.0, |acc, x| acc + x);
+            print!("avg: {}", avg);
+            println!(" vs lowest error: {}", self.lowest_error);
+            if self.lowest_error > avg || self.lowest_error == -1.0 as f32 {
+                println!("new lowest error: {}", avg);
+                self.lowest_error = avg;
+                result = true;
+            }
+            // process the evaluation_window buffer
+            self.evaluation_window.clear();
+
+        }
+        result
+    }
+
+    //TODO: include name score etc in serialization here (can just write to the directory created)
     //save the model out to disk in this directory as default
     pub fn save(&mut self, dir: String) -> Result<(), Box<dyn Error>> {
         // save the model to disk in the current directory
         if self.SavedModelSaver.borrow().is_none() {
-            //TODO: this should be in constructor but is here currently because borrow checker problems
-            // if self.session.is_none() {
-            // let mut session_options = &self.session_options;
-            // let session = Session::new(&session_options, &self.scope.graph())?;
-            // let session = self.session;
-            // self.session = Some(session);
-            // }
             println!("initializing saved model saver..");
             let mut all_vars = self.net_vars.clone();
             all_vars.extend_from_slice(&self.minimize_vars);
-            let mut last_layer = self.net_layers.last().unwrap().clone();
             let mut builder = tensorflow::SavedModelBuilder::new();
             builder
                 .add_collection("train", &all_vars)
@@ -590,10 +638,6 @@ impl NormNet {
                             },
                         ),
                     );
-                    // def.add_output_info(
-                    //     REGRESS_OUTPUTS.to_string(),
-                    //     TensorInfo::new(DataType::Float, Shape::from(None), self.Output.name()?),
-                    // );
 
                     def
                 });
@@ -605,22 +649,43 @@ impl NormNet {
         let uuid = Uuid::new_v4();
         self.SavedModelSaver.borrow_mut().as_mut().unwrap().save(
             &self.session,
-            // &self.graph.unwrap(),
             &self.scope.graph(),
             //TODO: ensure this is cur_directory and pass in user specification with this as default
-            format!("{}/{}", dir, uuid),
+            format!("{}/{}_{}_{}", dir, self.name, self.lowest_error, self.checkpoint_count),
         )?;
+
         Ok(())
     }
 
-    ///load the model from disk and store it in self.Serialized
+
+    ///load the most recent saved model from disk and store it in self.Serialized
     pub fn load(&mut self, dir: String) -> Result<(), Box<dyn Error>> {
         // load the model from disk in the given directory
+        //search the dir for the most recent model (highest checkpoint count and matching name)
+        let mut target_model = "".to_string();
+        // for entry in fs::read_dir(dir.clone())? {
+        //     let entry = entry?;
+        //     let path = entry.path();
+        //     let file_name = path.file_name().unwrap().to_str().unwrap();
+        //     let file_name_split: Vec<&str> = file_name.split("-").collect();
+        //     if file_name_split[0] == self.name {
+        //         let file_name_split: Vec<&str> = file_name_split[1].split(".").collect();
+        //         let score = file_name_split[0].unwrap();
+        //         // score is a 1D Tensor as a string e.g.: [[0.0], [0.0], [0.0], [0.0], [0.0]]
+        //         // create a tensor using the score value with shape of lowest_error
+        //         if score < self.lowest_error {
+        //         // use the proper comparison operator
+        //             self.lowest_error = score;
+        //             self.checkpoint_count = file_name_split[1].parse::<u64>().unwrap();
+        //             target_model=dir.clone();
+        //         }
+        //     }
+        // }
         println!("loading previously saved model..");
         let mut graph = Graph::new();
         //TODO: ensure we can access variables from graph or otherwise
         let bundle =
-            SavedModelBundle::load(&self.session_options, &["serve", "train"], &mut graph, dir)?;
+            SavedModelBundle::load(&self.session_options, &["serve", "train"], &mut graph, target_model)?;
         let signature = bundle
             .meta_graph_def()
             .get_signature(REGRESS_METHOD_NAME)?
@@ -636,8 +701,6 @@ impl NormNet {
         self.minimize =
             graph.operation_by_name_required(&signature.get_input("minimize")?.name().name)?;
 
-        // TODO: @DEPRECATED with construction var initialization
-        self.is_loaded = true;
         Ok(())
     }
 
@@ -655,11 +718,9 @@ impl NormNet {
         // TODO: extract from class: pass these is instead of constructing
         // error: Operation,
         // learning_rate: f32,
-    ) -> Result<Vec<Tensor<f32>>, Status> {
-        let mut run_args = SessionRunArgs::new();
-
-
+    ) -> Result<Vec<Tensor<f32>>, Box<dyn Error>> {
         //TODO: randomize input and labels while k-folding
+        assert_eq!(inputs.len(), labels.len());
         println!("trainning..");
         let mut result = vec![];
 
@@ -672,6 +733,7 @@ impl NormNet {
 
         let mut input_iter = inputs.into_iter();
         let mut label_iter = labels.into_iter();
+        //TODO: shouldnt have to do this
         input_iter.next();
         label_iter.next();
         let mut i = 0;
@@ -722,11 +784,127 @@ impl NormNet {
                 "training on {}\n input: {:?} label: {:?} error: {} output: {} time/epoch(ms): {:?}",
                 i, input, label, res, output,average 
             );
+            self.register_error(res.clone());
 
             result.push(res);
         }
 
         Ok(result)
+    }
+    //TODO: train_checkpoint_search
+    ///trains on the given inputs and labels until search_iterations have been completed.
+    ///if the network scores higher than delta_loss, the network is checkpointed 
+    ///(serialized and saved to the given directory).
+    /// delta loss is the amount of improvement in the moving window average error required to checkpoint the network.
+    pub fn train_checkpoint_search<T: tensorflow::TensorType>(&mut self, inputs: Vec<Vec<T>>, labels: Vec<Vec<T>>, delta_loss: f32, search_iterations: u64,dir: String) -> Result<(), Box<dyn Error>> {
+        let iterations_per_epoch = inputs.len() as u64;
+        let iterations = search_iterations-iterations_per_epoch;
+        let mut input_tensor: Tensor<T> = Tensor::new(&[1u64, inputs[0].len() as u64]);
+        let mut label_tensor: Tensor<T> = Tensor::new(&[1u64, labels[0].len() as u64]);
+        for i in 0..iterations{
+            // let res = self.train(inputs.clone(), labels.clone())?;
+
+            //START OF TRAIN SUBROUTINE
+            assert_eq!(inputs.len(), labels.len());
+            println!("trainning..");
+    
+            println!("inputs.len(): {}", inputs.len());
+            println!("{}", inputs[0].len());
+            println!("{}", labels[0].len());
+    
+            let input_itl = inputs.clone();
+            let label_itl = labels.clone();
+            let mut input_iter = input_itl.iter();
+            let mut label_iter = label_itl.iter();
+            //TODO: shouldnt have to do this
+            input_iter.next();
+            label_iter.next();
+
+            let mut i = 0;
+            let mut avg_t = vec![];
+            loop{
+                // start a timer
+                let start = Instant::now();
+                i += 1;
+                let input = input_iter.next();
+                let label = label_iter.next();
+                // move by clone
+                // let input = input.clone();
+                // let label = label.clone();
+
+                if input.is_none() || label.is_none() {
+                    break;
+                }
+                let input = input.unwrap();
+                let label = label.unwrap();
+                // now get input and label as slices
+                let input = input.as_slice();
+                let label = label.as_slice();
+                // now assign the input and label to the tensor
+                for i in 0..input.len() {
+                    input_tensor[i] = input[i].clone();
+                }
+                for i in 0..label.len() {
+                    label_tensor[i] = label[i].clone();
+                }
+
+                let mut run_args = SessionRunArgs::new();
+                run_args.add_target(&self.minimize);
+
+                let error_squared_fetch = run_args.request_fetch(&self.Error, 0);
+                let output = run_args.request_fetch(&self.Output_op, 0);
+                run_args.add_feed(&self.Input, 0, &input_tensor);
+                run_args.add_feed(&self.Label, 0, &label_tensor);
+                self.session.run(&mut run_args)?;
+
+                let res: Tensor<f32> = run_args.fetch(error_squared_fetch)?;
+                let output: Tensor<T> = run_args.fetch(output)?;
+
+                // get how long has passed
+                let elapsed = start.elapsed();
+                avg_t.push(elapsed.as_secs_f32());
+
+                // update the moving average for time
+                let average = avg_t.iter().sum::<f32>() / avg_t.len() as f32;
+
+                println!(
+                    "training on {}\n input: {:?} label: {:?} error: {} output: {} time/epoch(ms): {:?}",
+                    i, input, label, res, output,average 
+                );
+
+                let cur_error = self.lowest_error;
+                let best_score = self.register_error(res.clone());
+                if best_score {
+                    // TODO: incorporate delta_loss
+                    if cur_error - self.lowest_error > delta_loss {
+                        println!("checkpointing..");
+                        self.checkpoint_count += 1;
+                        println!("new checkpoint count: {}", self.checkpoint_count);
+                        self.save(dir.clone())?;
+                    }
+                    println!("new best score: {:?}", self.lowest_error);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    //TODO: load_checkpoint_search
+    //stochastically (with 'selection_pressure=n' for fitness) select checkpointed models 
+    //and save them if they are 'delta_fitness=x' above the previous lowest_error
+    ///stochastically select a model from dir with selection_pressure for the models fitness
+    pub fn load_checkpoint_search(self, selection_pressure: f32, dir: String) -> Result<(), Box<dyn Error>> {
+        let mut files = vec![];
+        let mut files_iter = fs::read_dir(dir)?;
+        while let Some(file) = files_iter.next() {
+            files.push(file?.path());
+        }
+        let mut files_iter = files.iter();
+        let mut lowest_error = f32::MAX;
+        let mut lowest_error_file = String::new();
+
+        Ok(())
     }
 }
 
@@ -739,8 +917,7 @@ mod tests {
         use crate::*;
 
         //CONSTRUCTION//
-        let mut scope = Scope::new_root_scope();
-        let mut norm_net = NormNet::new(2, 1, 10, 10, 10, 10.0, 5 as f32).unwrap();
+        let mut norm_net = NormNet::new("test_net",2, 1, 10, 10, 10, 1.0, 10,5 as f32).unwrap();
 
         //FITNESS FUNCTION//
         //TODO: auto gen labels from outputs and fitness function.
@@ -759,7 +936,6 @@ mod tests {
             outputs.push(output);
         }
 
-        assert_eq!(inputs.len(), outputs.len());
         norm_net.train(inputs, outputs).unwrap();
     }
 
@@ -771,14 +947,13 @@ mod tests {
         use crate::*;
 
         //CONSTRUCTION//
-        let mut scope = Scope::new_root_scope();
-        let mut norm_net = NormNet::new(2, 1, 20, 15, 10, 0.01, 5 as f32).unwrap();
+        let mut norm_net = NormNet::new("test_serialization",2, 1, 20, 15, 10, 0.01, 10,5 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
         // create 100 entries for inputs and outputs of xor
-        for _ in 0..700 {
+        for _ in 0..7 {
             // instead of the above, generate either 0 or 1 and cast to f32
             let input = vec![(rrng.gen::<u8>() & 1) as f32, (rrng.gen::<u8>() & 1) as f32];
             let output = vec![(input[0] as u8 ^ input[1] as u8) as f32];
@@ -787,7 +962,6 @@ mod tests {
             outputs.push(output);
         }
 
-        assert_eq!(inputs.len(), outputs.len());
         norm_net.train(inputs.clone(), outputs.clone()).unwrap();
 
         // save the network
@@ -796,9 +970,9 @@ mod tests {
             .unwrap();
 
         //load the network
-        let mut path = "";
+        let mut path = "".to_string();
         //NOTE: dont ever call a string something else in your crates or someone I know will find you.
-        let mut e = std::path::PathBuf::new();
+        let _ = std::path::PathBuf::new();
         for entry in fs::read_dir("test_serialized_models/").unwrap() {
             let entry = entry.unwrap();
             let is_dir = entry.path();
@@ -806,9 +980,8 @@ mod tests {
             if !is_dir.is_dir() {
                 continue;
             } else {
-                e = is_dir;
+                path = is_dir.clone().to_str().unwrap().to_string();
             }
-            path = e.to_str().unwrap();
             println!("{:?}", path);
         }
         let path = path.to_string();
@@ -818,5 +991,26 @@ mod tests {
 
         //TODO: perform all operations and assert the parameters are the same
         norm_net.train(inputs, outputs).unwrap();
+    }
+    #[test]
+    fn test_checkpoint(){
+        println!("test_checkpoint");
+        use crate::*;
+        //CONSTRUCTION//
+        let mut norm_net = NormNet::new("test_checkpoint",2, 1, 20, 15, 10, 0.01, 10,5 as f32).unwrap();
+        //TRAIN//
+        let mut rrng = rand::thread_rng();
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        // create entries for inputs and outputs of xor
+        for _ in 0..10 {
+            // instead of the above, generate either 0 or 1 and cast to f32
+            let input = vec![(rrng.gen::<u8>() & 1) as f32, (rrng.gen::<u8>() & 1) as f32];
+            let output = vec![(input[0] as u8 ^ input[1] as u8) as f32];
+
+            inputs.push(input);
+            outputs.push(output);
+        }
+        norm_net.train_checkpoint_search(inputs.clone(), outputs.clone(), 10.0, 200, "test_checkpoint_models".to_string()).unwrap();
     }
 }
