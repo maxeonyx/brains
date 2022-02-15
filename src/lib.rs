@@ -383,6 +383,7 @@ pub struct NormNet<'a> {
     ///the highest score achieved (lowest error) as a sum of the error vector. 
     ///initialized to -1 since error can never be negative.
     lowest_error: f32,
+    //TODO: this should be parameterized in checkpoint function instead of class state
     ///the size of the moving average for the lowest error
     evaluation_window_size: u64,
     ///the moving average window of labels trained on before the score is evaluated
@@ -473,10 +474,10 @@ impl <'a>NormNet <'a>{
         let SavedModelSaver= RefCell::new(None);
 
         //TODO: pass this in? this should be modular so new implementations can be tried
-        //  let mut optimizer = AdadeltaOptimizer::new();
-        //  optimizer.set_learning_rate(ops::constant(learning_rate, &mut scope)?);
-        let mut optimizer =
-            GradientDescentOptimizer::new(ops::constant(learning_rate, &mut scope)?);
+         let mut optimizer = AdadeltaOptimizer::new();
+         optimizer.set_learning_rate(ops::constant(learning_rate, &mut scope)?);
+        // let mut optimizer =
+        //     GradientDescentOptimizer::new(ops::constant(learning_rate, &mut scope)?);
 
         // DEFINE ERROR FUNCTION //
         //TODO: pass this in conditionally, give user output and label with
@@ -562,8 +563,8 @@ impl <'a>NormNet <'a>{
 
         if self.evaluation_window.len() >= self.evaluation_window_size as usize {
             println!("evaluation window is full");
-            // average evaluation_window (dont need to divide since always comparing this value relatively)
-            let avg = self.evaluation_window.iter().fold(0.0, |acc, x| acc + x);
+            // average evaluation_window (dont need to divide since always comparing this value relatively) but we do so for more intuitive metrics relative to per column error
+            let avg = self.evaluation_window.iter().fold(0.0, |acc, x| acc + x)/ self.evaluation_window.len() as f32;
             print!("avg: {}", avg);
             println!(" vs lowest error: {}", self.lowest_error);
             if self.lowest_error > avg || self.lowest_error == -1.0 as f32 {
@@ -647,11 +648,13 @@ impl <'a>NormNet <'a>{
         //TODO: annotate this with user input, fitness and checkpoint number
         // generate a uuid
         let uuid = Uuid::new_v4();
+        let st =format!("{}/{}_{}_{}", dir, self.name, self.lowest_error, self.checkpoint_count);
+        println!("saving model to {}", st);
         self.SavedModelSaver.borrow_mut().as_mut().unwrap().save(
             &self.session,
             &self.scope.graph(),
             //TODO: ensure this is cur_directory and pass in user specification with this as default
-            format!("{}/{}_{}_{}", dir, self.name, self.lowest_error, self.checkpoint_count),
+            format!("{}/{}_{:?}_{}", dir, self.name, self.lowest_error, self.checkpoint_count),
         )?;
 
         Ok(())
@@ -791,17 +794,18 @@ impl <'a>NormNet <'a>{
 
         Ok(result)
     }
-    //TODO: train_checkpoint_search
+
+    //TODO: search iterations should see different datasets/epochs of dataset (not actual epoch backprop) via k-folding
+    //      also cross validate the k-fold
     ///trains on the given inputs and labels until search_iterations have been completed.
     ///if the network scores higher than delta_loss, the network is checkpointed 
     ///(serialized and saved to the given directory).
     /// delta loss is the amount of improvement in the moving window average error required to checkpoint the network.
-    pub fn train_checkpoint_search<T: tensorflow::TensorType>(&mut self, inputs: Vec<Vec<T>>, labels: Vec<Vec<T>>, delta_loss: f32, search_iterations: u64,dir: String) -> Result<(), Box<dyn Error>> {
-        let iterations_per_epoch = inputs.len() as u64;
-        let iterations = search_iterations-iterations_per_epoch;
+    pub fn train_checkpoint_search<T: tensorflow::TensorType>(&mut self, inputs: Vec<Vec<T>>, labels: Vec<Vec<T>>, search_iterations: u64,dir: String) -> Result<(), Box<dyn Error>> {
         let mut input_tensor: Tensor<T> = Tensor::new(&[1u64, inputs[0].len() as u64]);
         let mut label_tensor: Tensor<T> = Tensor::new(&[1u64, labels[0].len() as u64]);
-        for i in 0..iterations{
+        //TODO: @DEPRECATED: iterations, window_size given dataset is sufficient this should be k-fold instead
+        for i in 0..search_iterations{
             // let res = self.train(inputs.clone(), labels.clone())?;
 
             //START OF TRAIN SUBROUTINE
@@ -859,6 +863,7 @@ impl <'a>NormNet <'a>{
 
                 let res: Tensor<f32> = run_args.fetch(error_squared_fetch)?;
                 let output: Tensor<T> = run_args.fetch(output)?;
+                //END TRAIN SUBROUTINE
 
                 // get how long has passed
                 let elapsed = start.elapsed();
@@ -875,13 +880,10 @@ impl <'a>NormNet <'a>{
                 let cur_error = self.lowest_error;
                 let best_score = self.register_error(res.clone());
                 if best_score {
-                    // TODO: incorporate delta_loss
-                    if cur_error - self.lowest_error > delta_loss {
-                        println!("checkpointing..");
-                        self.checkpoint_count += 1;
-                        println!("new checkpoint count: {}", self.checkpoint_count);
-                        self.save(dir.clone())?;
-                    }
+                    println!("checkpointing..");
+                    self.checkpoint_count += 1;
+                    println!("new checkpoint count: {}", self.checkpoint_count);
+                    self.save(dir.clone())?;
                     println!("new best score: {:?}", self.lowest_error);
                 }
             }
@@ -997,13 +999,13 @@ mod tests {
         println!("test_checkpoint");
         use crate::*;
         //CONSTRUCTION//
-        let mut norm_net = NormNet::new("test_checkpoint",2, 1, 20, 15, 10, 0.01, 10,5 as f32).unwrap();
+        let mut norm_net = NormNet::new("test_checkpoint",2, 1, 20, 15, 10, 0.1, 100,5 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
         // create entries for inputs and outputs of xor
-        for _ in 0..10 {
+        for _ in 0..1000 {
             // instead of the above, generate either 0 or 1 and cast to f32
             let input = vec![(rrng.gen::<u8>() & 1) as f32, (rrng.gen::<u8>() & 1) as f32];
             let output = vec![(input[0] as u8 ^ input[1] as u8) as f32];
@@ -1011,6 +1013,7 @@ mod tests {
             inputs.push(input);
             outputs.push(output);
         }
-        norm_net.train_checkpoint_search(inputs.clone(), outputs.clone(), 10.0, 200, "test_checkpoint_models".to_string()).unwrap();
+        //TODO: window size and training_iterations is hyperparameter for arch search. they should exist in shared struct or function parameter 
+        norm_net.train_checkpoint_search(inputs.clone(), outputs.clone(),  200, "test_checkpoint_models".to_string()).unwrap();
     }
 }
