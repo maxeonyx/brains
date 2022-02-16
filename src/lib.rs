@@ -826,92 +826,90 @@ impl <'a>NormNet <'a>{
     ///if the network scores higher than delta_loss, the network is checkpointed 
     ///(serialized and saved to the given directory).
     /// delta loss is the amount of improvement in the moving window average error required to checkpoint the network.
-    pub fn train_checkpoint_search<T: tensorflow::TensorType>(&mut self, inputs: Vec<Vec<T>>, labels: Vec<Vec<T>>, search_iterations: u64, evaluation_window_size: u64,dir: String) -> Result<(), Box<dyn Error>> {
+    pub fn train_checkpoint_search<T: tensorflow::TensorType>(&mut self, inputs: Vec<Vec<T>>, labels: Vec<Vec<T>>, evaluation_window_size: u64,dir: String) -> Result<(), Box<dyn Error>> {
+        assert!(evaluation_window_size < inputs.len() as u64, "evaluation window size must be less than input/output data");
+
         let mut input_tensor: Tensor<T> = Tensor::new(&[1u64, inputs[0].len() as u64]);
         let mut label_tensor: Tensor<T> = Tensor::new(&[1u64, labels[0].len() as u64]);
-        //TODO: @DEPRECATED: iterations, window_size given dataset is sufficient this should be k-fold instead
-        for i in 0..search_iterations{
-            // let res = self.train(inputs.clone(), labels.clone())?;
+        //TODO: k-fold
 
-            //START OF TRAIN SUBROUTINE
-            assert_eq!(inputs.len(), labels.len());
-            println!("trainning..");
-    
-            println!("inputs.len(): {}", inputs.len());
-            println!("{}", inputs[0].len());
-            println!("{}", labels[0].len());
-    
-            let input_itl = inputs.clone();
-            let label_itl = labels.clone();
-            let mut input_iter = input_itl.iter();
-            let mut label_iter = label_itl.iter();
-            //TODO: shouldnt have to do this
-            input_iter.next();
-            label_iter.next();
+        //START OF TRAIN SUBROUTINE
+        assert_eq!(inputs.len(), labels.len());
+        println!("trainning..");
 
-            let mut i = 0;
-            let mut avg_t = vec![];
-            loop{
-                // start a timer
-                let start = Instant::now();
-                i += 1;
-                let input = input_iter.next();
-                let label = label_iter.next();
-                // move by clone
-                // let input = input.clone();
-                // let label = label.clone();
+        println!("inputs.len(): {}", inputs.len());
+        println!("{}", inputs[0].len());
+        println!("{}", labels[0].len());
 
-                if input.is_none() || label.is_none() {
-                    break;
-                }
-                let input = input.unwrap();
-                let label = label.unwrap();
-                // now get input and label as slices
-                let input = input.as_slice();
-                let label = label.as_slice();
-                // now assign the input and label to the tensor
-                for i in 0..input.len() {
-                    input_tensor[i] = input[i].clone();
-                }
-                for i in 0..label.len() {
-                    label_tensor[i] = label[i].clone();
-                }
+        let input_itl = inputs.clone();
+        let label_itl = labels.clone();
+        let mut input_iter = input_itl.iter();
+        let mut label_iter = label_itl.iter();
+        //TODO: shouldnt have to do this
+        input_iter.next();
+        label_iter.next();
 
-                let mut run_args = SessionRunArgs::new();
-                run_args.add_target(&self.minimize);
+        let mut i = 0;
+        let mut avg_t = vec![];
+        loop{
+            // start a timer
+            let start = Instant::now();
+            i += 1;
+            let input = input_iter.next();
+            let label = label_iter.next();
+            // move by clone
+            // let input = input.clone();
+            // let label = label.clone();
 
-                let error_squared_fetch = run_args.request_fetch(&self.Error, 0);
-                let output = run_args.request_fetch(&self.Output_op, 0);
-                run_args.add_feed(&self.Input, 0, &input_tensor);
-                run_args.add_feed(&self.Label, 0, &label_tensor);
-                self.session.run(&mut run_args)?;
+            if input.is_none() || label.is_none() {
+                break;
+            }
+            let input = input.unwrap();
+            let label = label.unwrap();
+            // now get input and label as slices
+            let input = input.as_slice();
+            let label = label.as_slice();
+            // now assign the input and label to the tensor
+            for i in 0..input.len() {
+                input_tensor[i] = input[i].clone();
+            }
+            for i in 0..label.len() {
+                label_tensor[i] = label[i].clone();
+            }
 
-                let res: Tensor<f32> = run_args.fetch(error_squared_fetch)?;
-                let output: Tensor<T> = run_args.fetch(output)?;
-                //END TRAIN SUBROUTINE
+            let mut run_args = SessionRunArgs::new();
+            run_args.add_target(&self.minimize);
 
-                // get how long has passed
-                let elapsed = start.elapsed();
-                avg_t.push(elapsed.as_secs_f32());
+            let error_squared_fetch = run_args.request_fetch(&self.Error, 0);
+            let output = run_args.request_fetch(&self.Output_op, 0);
+            run_args.add_feed(&self.Input, 0, &input_tensor);
+            run_args.add_feed(&self.Label, 0, &label_tensor);
+            self.session.run(&mut run_args)?;
 
-                // update the moving average for time
-                let average = avg_t.iter().sum::<f32>() / avg_t.len() as f32;
+            let res: Tensor<f32> = run_args.fetch(error_squared_fetch)?;
+            let output: Tensor<T> = run_args.fetch(output)?;
+            //END TRAIN SUBROUTINE
 
-                println!(
-                    "training on {}\n input: {:?} label: {:?} error: {} output: {} time/epoch(ms): {:?}",
-                    i, input, label, res, output,average 
-                );
+            // get how long has passed
+            let elapsed = start.elapsed();
+            avg_t.push(elapsed.as_secs_f32());
 
-                //TODO: checkpoint timeout for loading a new checkpoint to search
-                let cur_error = self.lowest_error;
-                let best_score = self.register_error(res.clone(), evaluation_window_size);
-                if best_score {
-                    println!("checkpointing..");
-                    self.checkpoint_count += 1;
-                    println!("new checkpoint count: {}", self.checkpoint_count);
-                    self.save(dir.clone())?;
-                    println!("new best score: {:?}", self.lowest_error);
-                }
+            // update the moving average for time
+            let average = avg_t.iter().sum::<f32>() / avg_t.len() as f32;
+
+            println!(
+                "training on {}\n input: {:?} label: {:?} error: {} output: {} time/epoch(ms): {:?}",
+                i, input, label, res, output,average 
+            );
+
+            //TODO: checkpoint timeout for loading a new checkpoint to search
+            let best_score = self.register_error(res.clone(), evaluation_window_size);
+            if best_score {
+                println!("checkpointing..");
+                self.checkpoint_count += 1;
+                println!("new checkpoint count: {}", self.checkpoint_count);
+                self.save(dir.clone())?;
+                println!("new best score: {:?}", self.lowest_error);
             }
         }
 
@@ -1040,6 +1038,8 @@ mod tests {
             outputs.push(output);
         }
         //TODO: window size and training_iterations is hyperparameter for arch search. they should exist in shared struct or function parameter 
-        norm_net.train_checkpoint_search(inputs.clone(), outputs.clone(),  200,100, "test_checkpoint_models".to_string()).unwrap();
+        for _ in 0..100{
+            norm_net.train_checkpoint_search(inputs.clone(), outputs.clone(),  100, "test_checkpoint_models".to_string()).unwrap();
+        }
     }
 }
