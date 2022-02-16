@@ -11,6 +11,9 @@
 
 //allow unstable features
 // #![feature(int_log)]
+use serde::{Serialize, Deserialize};
+use serde_derive::{Serialize, Deserialize};
+use serde_json::{Value};
 use half::bf16;
 use half::f16;
 use std::cell::RefCell;
@@ -26,6 +29,7 @@ use rand::Rng;
 use std::os;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
+use std::collections::HashMap;
 use tensorflow::ops;
 use tensorflow::train::AdadeltaOptimizer;
 use tensorflow::train::GradientDescentOptimizer;
@@ -209,7 +213,7 @@ fn norm_layer_res<O1: Into<Output>>(
     Ok((vec![w.clone()], res))
 }
 
-//TODO: rename this now that methods are introduced and abstractions have occured but keep for low level accessibility
+//TODO: @DEPRECATED
 /// Creates a fully connected network with normalizing layers.
 /// handles all type input and output in the graph, just pass in and expect floats
 /// best data wrangling practices are still recommended, especially normalizing each
@@ -389,6 +393,16 @@ pub struct NormNet<'a> {
     ///the current name of the checkpoint being searched
     checkpoint_name: Option<String>,
 }
+///The serialized representation of the model outside of tensorflow graph.
+///Primarily used for checkpoint search meta-learner.
+#[derive(Serialize, Deserialize,Debug)]
+struct SerializedNetwork{
+    /// the previous checkpoint that created this checkpoint for informed graph 
+    /// selection checkpoint search
+    parent_search_name: String,
+    checkpoint_count: u64,
+    lowest_error: f32,
+}
 impl <'a>NormNet <'a>{
     //TODO: type safety: some of the meta-learning values should be 64 bit for overflow since we sum 32s etc.
     pub fn new(
@@ -559,13 +573,22 @@ impl <'a>NormNet <'a>{
         }else{
             name = parent_search_name.unwrap();
         }
+        // create a serialized_network object
+        let serialized_network = SerializedNetwork{
+            parent_search_name: name.clone(),
+            checkpoint_count: self.checkpoint_count,
+            lowest_error: self.lowest_error,
+        };
+
         //save the parent_search_name to dir which is where the model is saved, this is the edge to the checkpoint tree
-        let file_name = format!("{}/checkpoint_data", dir);
+        let file_name = format!("{}/checkpoint_data.json", dir);
         println!("serializing non-tensorflow graph variables: {}", file_name);
+        // append the file type .j
         // create the file
         let mut file = fs::File::create(file_name.clone())?;
+        let serialized_network_string = serde_json::to_string(&serialized_network)?;
         // open the file and write name to it
-        file.write_all(name.as_bytes())?;
+        file.write_all(serialized_network_string.as_bytes())?;
         //TODO: also save checkpoint_count or find some way to represent the edges such that its unecessary
         file.sync_all()?;
 
@@ -825,7 +848,9 @@ impl <'a>NormNet <'a>{
     ///trains on the given inputs and labels until search_iterations have been completed.
     ///if the network scores higher than delta_loss, the network is checkpointed 
     ///(serialized and saved to the given directory).
-    /// delta loss is the amount of improvement in the moving window average error required to checkpoint the network.
+    /// TODO:
+    /// once timeout is reached a previous checkpoint is selected stochastically with selection_pressure
+    /// and search resumes. This is repeated until search_iterations have been completed.
     pub fn train_checkpoint_search<T: tensorflow::TensorType>(&mut self, inputs: Vec<Vec<T>>, labels: Vec<Vec<T>>, evaluation_window_size: u64,dir: String) -> Result<(), Box<dyn Error>> {
         assert!(evaluation_window_size < inputs.len() as u64, "evaluation window size must be less than input/output data");
 
@@ -903,6 +928,7 @@ impl <'a>NormNet <'a>{
             );
 
             //TODO: checkpoint timeout for loading a new checkpoint to search
+            //TODO: self.cur_checkpoint for state across function calls here
             let best_score = self.register_error(res.clone(), evaluation_window_size);
             if best_score {
                 println!("checkpointing..");
@@ -921,12 +947,29 @@ impl <'a>NormNet <'a>{
     //and save them if they are 'delta_fitness=x' above the previous lowest_error
     ///stochastically select a model from dir with selection_pressure for the models fitness
     pub fn load_checkpoint_search(self, selection_pressure: f32, dir: String) -> Result<(), Box<dyn Error>> {
-        let mut files = vec![];
-        let mut files_iter = fs::read_dir(dir)?;
-        while let Some(file) = files_iter.next() {
-            files.push(file?.path());
+        let files_iter = fs::read_dir(dir)?;
+        let mut checkpoints = HashMap::new();
+
+        let items: Vec<(String, SerializedNetwork)> = files_iter.filter(|dir|
+            dir.as_ref().unwrap().path().is_dir())
+            .map(|dir| {
+                let dir = dir.unwrap().path().to_str().unwrap().to_string();
+                // get the file "checkpoint_data" from inside directory and read the first line
+                let target = dir.clone()+r"\checkpoint_data.json";
+                println!("{}", target);
+                // same as above but with from_reader
+                let deserialized_network:SerializedNetwork = serde_json::from_reader(fs::File::open(target.clone()).unwrap()).unwrap();
+                // store the checkpoint data in the hashmap with directory as key
+                (dir.to_string(), deserialized_network)
+        }).collect();
+        // store items in checkpoints where items.1 is key
+        for (key, value) in items {
+            checkpoints.insert(key, value);
         }
-        let mut files_iter = files.iter();
+        // print the hashmap
+        println!("{:?}", checkpoints);
+
+        // TODO: select a checkpoint stochastically with selection_pressure
         let mut lowest_error = f32::MAX;
         let mut lowest_error_file = String::new();
 
@@ -965,9 +1008,9 @@ mod tests {
         norm_net.train(inputs, outputs).unwrap();
     }
 
-    //TODO: save/load unittest
     #[test]
     fn test_serialization() {
+        //TODO: failing after checkpoint features
         println!("test_serialization");
         //call the main function
         use crate::*;
@@ -1018,6 +1061,7 @@ mod tests {
         //TODO: perform all operations and assert the parameters are the same
         norm_net.train(inputs, outputs).unwrap();
     }
+
     #[test]
     fn test_checkpoint(){
         println!("test_checkpoint");
@@ -1038,8 +1082,12 @@ mod tests {
             outputs.push(output);
         }
         //TODO: window size and training_iterations is hyperparameter for arch search. they should exist in shared struct or function parameter 
-        for _ in 0..100{
-            norm_net.train_checkpoint_search(inputs.clone(), outputs.clone(),  100, "test_checkpoint_models".to_string()).unwrap();
-        }
+        // for _ in 0..100{
+        // TEST TRAIN
+        norm_net.train_checkpoint_search(inputs.clone(), outputs.clone(),  100, "test_checkpoint_models".to_string()).unwrap();
+        // }
+
+        // TEST LOAD
+        norm_net.load_checkpoint_search(5.0, "test_checkpoint_models".to_string()).unwrap();
     }
 }
