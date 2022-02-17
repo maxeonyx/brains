@@ -1036,7 +1036,7 @@ mod tests {
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
         // create 100 entries for inputs and outputs of xor
-        for _ in 0..100000 {
+        for _ in 0..1000 {
             // instead of the above, generate either 0 or 1 and cast to f32
             let input = vec![(rrng.gen::<u8>() & 1) as f32, (rrng.gen::<u8>() & 1) as f32];
             let output = vec![(input[0] as u8 ^ input[1] as u8) as f32];
@@ -1062,7 +1062,7 @@ mod tests {
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
         // create 100 entries for inputs and outputs of xor
-        for _ in 0..7 {
+        for _ in 0..10 {
             // instead of the above, generate either 0 or 1 and cast to f32
             let input = vec![(rrng.gen::<u8>() & 1) as f32, (rrng.gen::<u8>() & 1) as f32];
             let output = vec![(input[0] as u8 ^ input[1] as u8) as f32];
@@ -1085,7 +1085,6 @@ mod tests {
         for entry in fs::read_dir("test_serialization/").unwrap() {
             let entry = entry.unwrap();
             let is_dir = entry.path();
-            //ensure e is a directory
             if !is_dir.is_dir() {
                 continue;
             } else {
@@ -1098,7 +1097,6 @@ mod tests {
 
         norm_net.load(path.to_string()).unwrap();
 
-        //TODO: perform all operations and assert the parameters are the same
         norm_net.train(inputs, outputs).unwrap();
     }
 
