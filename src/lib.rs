@@ -708,7 +708,6 @@ impl <'a>NormNet <'a>{
         //TODO: annotate this with user input, fitness and checkpoint number
         // generate a uuid
         let uuid = Uuid::new_v4();
-        // let cur_checkpoint_name = format!("{}/{}_{}_{}", dir, self.name, self.lowest_error, self.checkpoint_count);
         // same as above but just dir, name and a uuid
         let cur_checkpoint_name = format!("{}/{}_{}", self.name, self.name, uuid);
 
@@ -848,7 +847,7 @@ impl <'a>NormNet <'a>{
     ///trains on the given inputs and labels until search_iterations have been completed.
     ///if the network scores higher than delta_loss, the network is checkpointed 
     ///(serialized and saved to the given directory).
-    pub fn train_checkpoint_search<T: tensorflow::TensorType>(&mut self, inputs: Vec<Vec<T>>, labels: Vec<Vec<T>>, evaluation_window_size: u64,dir: String) -> Result<(), Box<dyn Error>> {
+    pub fn train_checkpoint_search<T: tensorflow::TensorType>(&mut self, inputs: Vec<Vec<T>>, labels: Vec<Vec<T>>, evaluation_window_size: u64) -> Result<(), Box<dyn Error>> {
         assert!(evaluation_window_size < inputs.len() as u64, "evaluation window size must be less than input/output data");
 
         let mut input_tensor: Tensor<T> = Tensor::new(&[1u64, inputs[0].len() as u64]);
@@ -1111,7 +1110,7 @@ mod tests {
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
         // create entries for inputs and outputs of xor
-        for _ in 0..1000 {
+        for _ in 0..100 {
             // instead of the above, generate either 0 or 1 and cast to f32
             let input = vec![(rrng.gen::<u8>() & 1) as f32, (rrng.gen::<u8>() & 1) as f32];
             let output = vec![(input[0] as u8 ^ input[1] as u8) as f32];
@@ -1122,9 +1121,9 @@ mod tests {
         //TODO: window size and training_iterations is hyperparameter for arch search. they should exist in shared struct or function parameter 
         //TODO: how can we train this in RL? need to store window and selection_pressure in class state
         //TODO: this needs to happen on initialization
-        for _ in 0..100{
+        for _ in 0..10{
             // TEST TRAIN
-            norm_net.train_checkpoint_search(inputs.clone(), outputs.clone(),  200, "test_checkpoint_models".to_string()).unwrap();
+            norm_net.train_checkpoint_search(inputs.clone(), outputs.clone(),  25).unwrap();
 
             // TEST LOAD
             norm_net.load_checkpoint_search(0.001).unwrap();
