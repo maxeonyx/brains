@@ -316,8 +316,6 @@ pub fn norm_net(
     Ok((net_layers, net_vars, input, label, scope))
 }
 
-//TODO: save and load from disk
-//TODO: does save/load require UUID? allow user to name in initialization for organization?
 //TODO: defaults such as learning rate
 //================
 //----NORM_NET----
@@ -362,8 +360,8 @@ pub fn norm_net(
 /// greater than Float range we are fine in the worst case (summing all 1's).
 /// Otherwise decimal precision of float type is our parameter type precision.
 pub struct NormNet<'a> {
-    //TODO: this is getting rather large, how can this be refactored? functionally?
-    //TODO: checkpoint based stuff is a meta-learner, consider refactoring to a seperate object for organization
+    //TODO: this is getting rather large, how can this be refactored? functionally? builders and defaults
+    //TODO: checkpoint based stuff is a meta-learner, consider extracting to a seperate object for organization (SerializedNetwork)
     /// Tensorflow objects for user abstraction from Tensorflow
     scope: Scope,
     session: Session,
@@ -520,8 +518,6 @@ impl <'a>NormNet <'a>{
             )?,
             &mut scope,
         )?;
-        //TODO: at least pass in the constant here as a gradient weighting scalar coefficient
-        //TODO: scalar coeffecient instead to prevent curving the gradient
         let Error = ops::pow(
             Error.clone(),
             ops::constant(error_power, &mut scope).unwrap(),
@@ -543,7 +539,6 @@ impl <'a>NormNet <'a>{
 
         // set parameters to be optimization targets if they havent been set already
         let mut run_args = SessionRunArgs::new();
-        //TODO: This is a strange way to initialize variables
         for var in &net_vars {
             run_args.add_target(&var.initializer());
         }
@@ -552,7 +547,7 @@ impl <'a>NormNet <'a>{
         }
         session.run(&mut run_args)?;
 
-        Ok(NormNet {
+        let mut init_norm_net = NormNet {
             name,
             scope,
             session: session,
@@ -569,7 +564,11 @@ impl <'a>NormNet <'a>{
             lowest_error,
             evaluation_window,
             checkpoint_name: None,
-        })
+        };
+        //TODO: refactor dir to self.name
+        fs::create_dir_all(init_norm_net.name).unwrap();
+        init_norm_net.save().unwrap();
+        Ok(init_norm_net)
     }
 
     // forward pass and return result
@@ -580,8 +579,9 @@ impl <'a>NormNet <'a>{
     /// save variables that arent in the Tensorflow graph that are needed for checkpointing
     /// this stores edge information about which checkpoints resulted in which for informed 
     /// selection of checkpoints. Any future serialization should also be implemented here.
-    fn serialize_network(&self, dir: String, parent_search_name: Option<String>) -> Result<(), Box::<dyn Error>> {
+    fn serialize_network(&self, dir: String) -> Result<(), Box::<dyn Error>> {
         let mut name = "".to_string();
+        let parent_search_name = self.checkpoint_name.clone();
         if parent_search_name.is_none(){
             //this is a root node of the checkpoint search graph
             name = "Root".to_string();
@@ -591,7 +591,8 @@ impl <'a>NormNet <'a>{
         // create a serialized_network object
         let serialized_network = SerializedNetwork{
             parent_search_name: name.clone(),
-            checkpoint_name: self.checkpoint_name.clone(),
+            //TODO: see if we can remove this option in NormNet
+            checkpoint_name: Some(dir.clone()),
             lowest_error: self.lowest_error,
         };
 
@@ -640,7 +641,7 @@ impl <'a>NormNet <'a>{
 
     //TODO: include name score etc in serialization here (can just write to the directory created)
     //save the model out to disk in this directory as default
-    pub fn save(&mut self, dir: String) -> Result<(), Box<dyn Error>> {
+    pub fn save(&mut self) -> Result<(), Box<dyn Error>> {
         // save the model to disk in the current directory
         if self.SavedModelSaver.borrow().is_none() {
             println!("initializing saved model saver..");
@@ -709,9 +710,8 @@ impl <'a>NormNet <'a>{
         let uuid = Uuid::new_v4();
         // let cur_checkpoint_name = format!("{}/{}_{}_{}", dir, self.name, self.lowest_error, self.checkpoint_count);
         // same as above but just dir, name and a uuid
-        let cur_checkpoint_name = format!("{}/{}_{}", dir, self.name, uuid);
+        let cur_checkpoint_name = format!("{}/{}_{}", self.name, self.name, uuid);
 
-        println!("serializing non-graph variables to {}", cur_checkpoint_name);
         //update checkpoint_name
         println!("saving model to {}", cur_checkpoint_name);
         self.SavedModelSaver.borrow_mut().as_mut().unwrap().save(
@@ -719,7 +719,8 @@ impl <'a>NormNet <'a>{
             &self.scope.graph(),
             cur_checkpoint_name.clone(),
         )?;
-        self.serialize_network(cur_checkpoint_name.clone(), self.checkpoint_name.clone())?;
+        println!("serializing non-graph variables to {}", cur_checkpoint_name);
+        self.serialize_network(cur_checkpoint_name.clone())?;
         self.checkpoint_name = Some(cur_checkpoint_name);
 
         Ok(())
@@ -839,20 +840,19 @@ impl <'a>NormNet <'a>{
         Ok(result)
     }
 
+    //TODO: k-fold
     //TODO: search iterations should see different datasets/epochs of dataset (not actual epoch backprop) via k-folding
     //      also cross validate the k-fold
+    //TODO: dataset structure with methods to yield k-fold and assertions for inputs and labels
+
     ///trains on the given inputs and labels until search_iterations have been completed.
     ///if the network scores higher than delta_loss, the network is checkpointed 
     ///(serialized and saved to the given directory).
-    /// TODO:
-    /// once timeout is reached a previous checkpoint is selected stochastically with selection_pressure
-    /// and search resumes. This is repeated until search_iterations have been completed.
     pub fn train_checkpoint_search<T: tensorflow::TensorType>(&mut self, inputs: Vec<Vec<T>>, labels: Vec<Vec<T>>, evaluation_window_size: u64,dir: String) -> Result<(), Box<dyn Error>> {
         assert!(evaluation_window_size < inputs.len() as u64, "evaluation window size must be less than input/output data");
 
         let mut input_tensor: Tensor<T> = Tensor::new(&[1u64, inputs[0].len() as u64]);
         let mut label_tensor: Tensor<T> = Tensor::new(&[1u64, labels[0].len() as u64]);
-        //TODO: k-fold
         //TODO: this can create collisions in the solutions, need to k-mediods cluster the solutions (last hyperparameter I promise)
 
         //START OF TRAIN SUBROUTINE
@@ -923,11 +923,10 @@ impl <'a>NormNet <'a>{
                 i, input, label, res, output,average 
             );
 
-            //TODO: checkpoint timeout for loading a new checkpoint to search
             let best_score = self.register_error(res.clone(), evaluation_window_size);
             if best_score {
                 println!("checkpointing..");
-                self.save(dir.clone())?;
+                self.save()?;
                 println!("new best score: {:?}", self.lowest_error);
             }
         }
@@ -939,11 +938,12 @@ impl <'a>NormNet <'a>{
     //stochastically (with 'selection_pressure=n' for fitness) select checkpointed models 
     //and save them if they are 'delta_fitness=x' above the previous lowest_error
     ///stochastically select a model from dir with selection_pressure for the models fitness
-    pub fn load_checkpoint_search(&mut self, selection_pressure: f32, dir: String) -> Result<(), Box<dyn Error>> {
+    pub fn load_checkpoint_search(&mut self, selection_pressure: f32) -> Result<(), Box<dyn Error>> {
         assert!(selection_pressure >= 0.0 && selection_pressure <= 1.0, "selection_pressure must be between 0 and 1");
-        let files_iter = fs::read_dir(dir)?;
+        let files_iter = fs::read_dir(self.name)?;
 
         let mut r = rand::thread_rng();
+        //TODO: extract this to helper functions to abstract the tree search operations and buffer/cache checkpoint_data from disk
         //TODO: rayon this becaus tree search
         // let items: Vec<(f32, String, SerializedNetwork)> = 
         let targets:Vec<(f32, String, SerializedNetwork)> = files_iter.filter(|dir|
@@ -979,10 +979,10 @@ impl <'a>NormNet <'a>{
         // assert!(highest_error*selection_pressure > lowest_error, "selection_pressure must be greater than the lowest error");
         let total_range = rand::thread_rng().gen_range(lowest_error..highest_error);
         //TODO: this doesnt allow sampling above the median
-        // find the median for the set {lowest_error,highest_error}
-        let median = (highest_error-lowest_error)/2.0 + lowest_error;
-        // now move the median to lowest error by selection_pressure
-        let highest_error= median - selection_pressure*(highest_error-lowest_error)/2.0;
+        // find the mean for the set {lowest_error,highest_error}
+        let mean= (highest_error-lowest_error)/2.0 + lowest_error;
+        // now move the mean to lowest error by selection_pressure
+        let highest_error= mean - selection_pressure*(highest_error-lowest_error)/2.0;
 
         let selection_threshold = rand::thread_rng().gen_range(lowest_error..highest_error);
 
@@ -998,14 +998,12 @@ impl <'a>NormNet <'a>{
         // now select with selection_pressure a network based on fitness
         let (res, dir, deserialized_network) = targets.into_iter().filter(|(lowest_error, _, _)| {
             //TODO: rework this
-            // let r = selection_threshold * selection_pressure;
             println!("selection limiter: {}", selection_threshold);
-            selection_threshold > lowest_error.clone()
+            selection > lowest_error.clone()
         })
         .inspect(|(lowest_error, dir, _)| {
             println!("choosing from: {} {:?}", lowest_error, dir);
         })
-        //TODO: would prefer to recurse with decay here and allow dir to unwrap if empty (otherwise there should always be a result)
         .choose(&mut r).context("no checkpoint found")?;
         //TODO: search the tree for diversity either by looking at the expected future reward of a node (unique traces to unique frontier nodes) 
         //      or searching as horizontally as possible from the current checkpoint node with fitness pressure
@@ -1077,14 +1075,14 @@ mod tests {
 
         // save the network
         norm_net
-            .save("test_serialized_models/".to_string())
+            .save()
             .unwrap();
 
         //load the network
         let mut path = "".to_string();
         //NOTE: dont ever call a string something else in your crates or someone I know will find you.
         let _ = std::path::PathBuf::new();
-        for entry in fs::read_dir("test_serialized_models/").unwrap() {
+        for entry in fs::read_dir("test_serialization/").unwrap() {
             let entry = entry.unwrap();
             let is_dir = entry.path();
             //ensure e is a directory
@@ -1124,14 +1122,14 @@ mod tests {
             outputs.push(output);
         }
         //TODO: window size and training_iterations is hyperparameter for arch search. they should exist in shared struct or function parameter 
+        //TODO: how can we train this in RL? need to store window and selection_pressure in class state
         //TODO: this needs to happen on initialization
-        norm_net.save("test_checkpoint_models".to_string()).unwrap();
         for _ in 0..100{
             // TEST TRAIN
             norm_net.train_checkpoint_search(inputs.clone(), outputs.clone(),  200, "test_checkpoint_models".to_string()).unwrap();
 
             // TEST LOAD
-            norm_net.load_checkpoint_search(0.001, "test_checkpoint_models".to_string()).unwrap();
+            norm_net.load_checkpoint_search(0.001).unwrap();
 
         }
     }
