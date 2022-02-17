@@ -22,8 +22,10 @@ use std::error::Error;
 use std::fs;
 use std::io::{Write, Read};
 use std::io::ErrorKind;
+use rand::seq::IteratorRandom;
 use std::path::Path;
 use std::result::Result;
+use anyhow::{Context};
 //TODO: clean this up with proper heirachy
 use rand::Rng;
 use std::os;
@@ -383,8 +385,6 @@ pub struct NormNet<'a> {
     SavedModelSaver: RefCell<Option<SavedModelSaver>>,
     ///user specified name of this model
     name: &'a str,
-    ///the current checkpoint count
-    checkpoint_count: u64,
     ///the highest score achieved (lowest error) as a sum of the error vector. 
     ///initialized to -1 since error can never be negative.
     lowest_error: f32,
@@ -397,11 +397,26 @@ pub struct NormNet<'a> {
 ///Primarily used for checkpoint search meta-learner.
 #[derive(Serialize, Deserialize,Debug)]
 struct SerializedNetwork{
-    /// the previous checkpoint that created this checkpoint for informed graph 
-    /// selection checkpoint search
+    /// The previous checkpoint that created this checkpoint for informed graph 
+    /// selection checkpoint search.
     parent_search_name: String,
-    checkpoint_count: u64,
+    checkpoint_name: Option<String>,
     lowest_error: f32,
+} impl SerializedNetwork{
+    /// Constructs a new serialized network from a checkpoint name and the lowest error
+    fn new(parent_search_name: String, checkpoint_name: Option<String>, lowest_error: f32) -> Self{
+        Self{
+            parent_search_name,
+            checkpoint_name,
+            lowest_error,
+        }
+    }
+    fn restore(self, norm_net: &mut NormNet) {
+        // let mut NormNet = NormNet.clone();
+        norm_net.checkpoint_name = self.checkpoint_name;
+        norm_net.lowest_error = self.lowest_error;
+        // NormNet
+    }
 }
 impl <'a>NormNet <'a>{
     //TODO: type safety: some of the meta-learning values should be 64 bit for overflow since we sum 32s etc.
@@ -513,7 +528,8 @@ impl <'a>NormNet <'a>{
             &mut scope.with_op_name("error"),
         )?;
 
-        let mut lowest_error = -1.0 as f32;
+        // let mut lowest_error = -1.0 as f32;
+        let mut lowest_error = f32::MAX;
         let mut evaluation_window = vec![];
 
         let (minimize_vars, minimize) = optimizer
@@ -552,7 +568,6 @@ impl <'a>NormNet <'a>{
             SavedModelSaver,
             lowest_error,
             evaluation_window,
-            checkpoint_count: 0,
             checkpoint_name: None,
         })
     }
@@ -576,7 +591,7 @@ impl <'a>NormNet <'a>{
         // create a serialized_network object
         let serialized_network = SerializedNetwork{
             parent_search_name: name.clone(),
-            checkpoint_count: self.checkpoint_count,
+            checkpoint_name: self.checkpoint_name.clone(),
             lowest_error: self.lowest_error,
         };
 
@@ -589,7 +604,6 @@ impl <'a>NormNet <'a>{
         let serialized_network_string = serde_json::to_string(&serialized_network)?;
         // open the file and write name to it
         file.write_all(serialized_network_string.as_bytes())?;
-        //TODO: also save checkpoint_count or find some way to represent the edges such that its unecessary
         file.sync_all()?;
 
         Ok(())
@@ -693,7 +707,9 @@ impl <'a>NormNet <'a>{
         //TODO: annotate this with user input, fitness and checkpoint number
         // generate a uuid
         let uuid = Uuid::new_v4();
-        let cur_checkpoint_name = format!("{}/{}_{}_{}", dir, self.name, self.lowest_error, self.checkpoint_count);
+        // let cur_checkpoint_name = format!("{}/{}_{}_{}", dir, self.name, self.lowest_error, self.checkpoint_count);
+        // same as above but just dir, name and a uuid
+        let cur_checkpoint_name = format!("{}/{}_{}", dir, self.name, uuid);
 
         println!("serializing non-graph variables to {}", cur_checkpoint_name);
         //update checkpoint_name
@@ -709,34 +725,14 @@ impl <'a>NormNet <'a>{
         Ok(())
     }
 
-    ///load the most recent saved model from disk and store it in self.Serialized
+    /// load the saved model in the directory dir and restore it in self, removing the 
+    /// previous tensorflow graph and session.
     pub fn load(&mut self, dir: String) -> Result<(), Box<dyn Error>> {
-        // load the model from disk in the given directory
-        //search the dir for the most recent model (highest checkpoint count and matching name)
-        let mut target_model = "".to_string();
-        // for entry in fs::read_dir(dir.clone())? {
-        //     let entry = entry?;
-        //     let path = entry.path();
-        //     let file_name = path.file_name().unwrap().to_str().unwrap();
-        //     let file_name_split: Vec<&str> = file_name.split("-").collect();
-        //     if file_name_split[0] == self.name {
-        //         let file_name_split: Vec<&str> = file_name_split[1].split(".").collect();
-        //         let score = file_name_split[0].unwrap();
-        //         // score is a 1D Tensor as a string e.g.: [[0.0], [0.0], [0.0], [0.0], [0.0]]
-        //         // create a tensor using the score value with shape of lowest_error
-        //         if score < self.lowest_error {
-        //         // use the proper comparison operator
-        //             self.lowest_error = score;
-        //             self.checkpoint_count = file_name_split[1].parse::<u64>().unwrap();
-        //             target_model=dir.clone();
-        //         }
-        //     }
-        // }
         println!("loading previously saved model..");
         let mut graph = Graph::new();
         //TODO: ensure we can access variables from graph or otherwise
         let bundle =
-            SavedModelBundle::load(&self.session_options, &["serve", "train"], &mut graph, target_model)?;
+            SavedModelBundle::load(&self.session_options, &["serve", "train"], &mut graph, dir)?;
         let signature = bundle
             .meta_graph_def()
             .get_signature(REGRESS_METHOD_NAME)?
@@ -857,6 +853,7 @@ impl <'a>NormNet <'a>{
         let mut input_tensor: Tensor<T> = Tensor::new(&[1u64, inputs[0].len() as u64]);
         let mut label_tensor: Tensor<T> = Tensor::new(&[1u64, labels[0].len() as u64]);
         //TODO: k-fold
+        //TODO: this can create collisions in the solutions, need to k-mediods cluster the solutions (last hyperparameter I promise)
 
         //START OF TRAIN SUBROUTINE
         assert_eq!(inputs.len(), labels.len());
@@ -876,15 +873,14 @@ impl <'a>NormNet <'a>{
 
         let mut i = 0;
         let mut avg_t = vec![];
+        //TODO: save the root node of search properly (if it doesnt exist)
+        // self.save(dir.clone())?;
         loop{
             // start a timer
             let start = Instant::now();
             i += 1;
             let input = input_iter.next();
             let label = label_iter.next();
-            // move by clone
-            // let input = input.clone();
-            // let label = label.clone();
 
             if input.is_none() || label.is_none() {
                 break;
@@ -928,12 +924,9 @@ impl <'a>NormNet <'a>{
             );
 
             //TODO: checkpoint timeout for loading a new checkpoint to search
-            //TODO: self.cur_checkpoint for state across function calls here
             let best_score = self.register_error(res.clone(), evaluation_window_size);
             if best_score {
                 println!("checkpointing..");
-                self.checkpoint_count += 1;
-                println!("new checkpoint count: {}", self.checkpoint_count);
                 self.save(dir.clone())?;
                 println!("new best score: {:?}", self.lowest_error);
             }
@@ -946,11 +939,14 @@ impl <'a>NormNet <'a>{
     //stochastically (with 'selection_pressure=n' for fitness) select checkpointed models 
     //and save them if they are 'delta_fitness=x' above the previous lowest_error
     ///stochastically select a model from dir with selection_pressure for the models fitness
-    pub fn load_checkpoint_search(self, selection_pressure: f32, dir: String) -> Result<(), Box<dyn Error>> {
+    pub fn load_checkpoint_search(&mut self, selection_pressure: f32, dir: String) -> Result<(), Box<dyn Error>> {
+        assert!(selection_pressure >= 0.0 && selection_pressure <= 1.0, "selection_pressure must be between 0 and 1");
         let files_iter = fs::read_dir(dir)?;
-        let mut checkpoints = HashMap::new();
 
-        let items: Vec<(String, SerializedNetwork)> = files_iter.filter(|dir|
+        let mut r = rand::thread_rng();
+        //TODO: rayon this becaus tree search
+        // let items: Vec<(f32, String, SerializedNetwork)> = 
+        let targets:Vec<(f32, String, SerializedNetwork)> = files_iter.filter(|dir|
             dir.as_ref().unwrap().path().is_dir())
             .map(|dir| {
                 let dir = dir.unwrap().path().to_str().unwrap().to_string();
@@ -960,18 +956,64 @@ impl <'a>NormNet <'a>{
                 // same as above but with from_reader
                 let deserialized_network:SerializedNetwork = serde_json::from_reader(fs::File::open(target.clone()).unwrap()).unwrap();
                 // store the checkpoint data in the hashmap with directory as key
-                (dir.to_string(), deserialized_network)
-        }).collect();
-        // store items in checkpoints where items.1 is key
-        for (key, value) in items {
-            checkpoints.insert(key, value);
-        }
-        // print the hashmap
-        println!("{:?}", checkpoints);
+                (deserialized_network.lowest_error, dir.to_string(), deserialized_network)
+        })
+        .inspect(|x| println!("{:?}", x.0)).collect();
 
-        // TODO: select a checkpoint stochastically with selection_pressure
+        // find the lowest error in targets
         let mut lowest_error = f32::MAX;
-        let mut lowest_error_file = String::new();
+        targets.iter().filter(|(error,_,_)| error > &0.0).for_each(|(error,_,_)| {
+            if error < &lowest_error{
+                lowest_error = error.clone();
+            }
+        });
+        // find the highest error in targets
+        let mut highest_error = f32::MIN;
+        // we filter f32::MAX which is root node and arbitrarily high
+        targets.iter().filter(|(error,_,_)| error < &f32::MAX).for_each(|(error,_,_)| {
+            if error > &highest_error{
+                highest_error = error.clone();
+            }
+        });
+
+        // assert!(highest_error*selection_pressure > lowest_error, "selection_pressure must be greater than the lowest error");
+        let total_range = rand::thread_rng().gen_range(lowest_error..highest_error);
+        //TODO: this doesnt allow sampling above the median
+        // find the median for the set {lowest_error,highest_error}
+        let median = (highest_error-lowest_error)/2.0 + lowest_error;
+        // now move the median to lowest error by selection_pressure
+        let highest_error= median - selection_pressure*(highest_error-lowest_error)/2.0;
+
+        let selection_threshold = rand::thread_rng().gen_range(lowest_error..highest_error);
+
+        let mut selection = 0.0;
+        if total_range > selection_threshold {
+            selection = total_range - selection_threshold;
+        }else {
+            selection = selection_threshold;
+        }
+
+        println!("selection_threshold: {}", selection_threshold);
+
+        // now select with selection_pressure a network based on fitness
+        let (res, dir, deserialized_network) = targets.into_iter().filter(|(lowest_error, _, _)| {
+            //TODO: rework this
+            // let r = selection_threshold * selection_pressure;
+            println!("selection limiter: {}", selection_threshold);
+            selection_threshold > lowest_error.clone()
+        })
+        .inspect(|(lowest_error, dir, _)| {
+            println!("choosing from: {} {:?}", lowest_error, dir);
+        })
+        //TODO: would prefer to recurse with decay here and allow dir to unwrap if empty (otherwise there should always be a result)
+        .choose(&mut r).context("no checkpoint found")?;
+        //TODO: search the tree for diversity either by looking at the expected future reward of a node (unique traces to unique frontier nodes) 
+        //      or searching as horizontally as possible from the current checkpoint node with fitness pressure
+
+        println!("loading network with fitness: {:?}", res);
+        self.load(dir)?;
+        deserialized_network.restore(self);
+        // TODO: if Root node is selected, reinitialize all variables for random seed of network to ensure robust search
 
         Ok(())
     }
@@ -1082,12 +1124,15 @@ mod tests {
             outputs.push(output);
         }
         //TODO: window size and training_iterations is hyperparameter for arch search. they should exist in shared struct or function parameter 
-        // for _ in 0..100{
-        // TEST TRAIN
-        norm_net.train_checkpoint_search(inputs.clone(), outputs.clone(),  100, "test_checkpoint_models".to_string()).unwrap();
-        // }
+        //TODO: this needs to happen on initialization
+        norm_net.save("test_checkpoint_models".to_string()).unwrap();
+        for _ in 0..100{
+            // TEST TRAIN
+            norm_net.train_checkpoint_search(inputs.clone(), outputs.clone(),  200, "test_checkpoint_models".to_string()).unwrap();
 
-        // TEST LOAD
-        norm_net.load_checkpoint_search(5.0, "test_checkpoint_models".to_string()).unwrap();
+            // TEST LOAD
+            norm_net.load_checkpoint_search(0.001, "test_checkpoint_models".to_string()).unwrap();
+
+        }
     }
 }
