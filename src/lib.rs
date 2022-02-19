@@ -524,7 +524,6 @@ impl <'a>NormNet <'a>{
             &mut scope.with_op_name("error"),
         )?;
 
-        // let mut lowest_error = -1.0 as f32;
         let mut lowest_error = f32::MAX;
         let mut evaluation_window = vec![];
 
@@ -620,6 +619,9 @@ impl <'a>NormNet <'a>{
 
         println!("error sum: {}", error_sum);
         println!("lowest error: {}", self.lowest_error);
+        // print window length and evaluation_window_size
+        println!("window length: {}", self.evaluation_window.len());
+        println!("evaluation_window_size: {}", evaluation_window_size);
 
         if self.evaluation_window.len() >= evaluation_window_size as usize {
             println!("evaluation window is full");
@@ -945,7 +947,7 @@ impl <'a>NormNet <'a>{
         //TODO: extract this to helper functions to abstract the tree search operations and buffer/cache checkpoint_data from disk
         //TODO: rayon this becaus tree search
         // let items: Vec<(f32, String, SerializedNetwork)> = 
-        let targets:Vec<(f32, String, SerializedNetwork)> = files_iter.filter(|dir|
+        let targets:HashMap<String, SerializedNetwork> = files_iter.filter(|dir|
             dir.as_ref().unwrap().path().is_dir())
             .map(|dir| {
                 let dir = dir.unwrap().path().to_str().unwrap().to_string();
@@ -955,23 +957,24 @@ impl <'a>NormNet <'a>{
                 // same as above but with from_reader
                 let deserialized_network:SerializedNetwork = serde_json::from_reader(fs::File::open(target.clone()).unwrap()).unwrap();
                 // store the checkpoint data in the hashmap with directory as key
-                (deserialized_network.lowest_error, dir.to_string(), deserialized_network)
+                (dir.to_string(), deserialized_network)
         })
         .inspect(|x| println!("{:?}", x.0)).collect();
 
         // find the lowest error in targets
         let mut lowest_error = f32::MAX;
-        targets.iter().filter(|(error,_,_)| error > &0.0).for_each(|(error,_,_)| {
-            if error < &lowest_error{
-                lowest_error = error.clone();
+        targets.iter().filter(|(dir, serialized_network)| serialized_network.lowest_error > 0.0)
+        .for_each(|(dir, serialized_network)| {
+            if serialized_network.lowest_error < lowest_error{
+                lowest_error = serialized_network.lowest_error;
             }
         });
         // find the highest error in targets
         let mut highest_error = f32::MIN;
         // we filter f32::MAX which is root node and arbitrarily high
-        targets.iter().filter(|(error,_,_)| error < &f32::MAX).for_each(|(error,_,_)| {
-            if error > &highest_error{
-                highest_error = error.clone();
+        targets.iter().filter(|(dir, serialized_network)| serialized_network.lowest_error< f32::MAX).for_each(|(dir,serialized_network)| {
+            if serialized_network.lowest_error > highest_error{
+                highest_error = serialized_network.lowest_error.clone();
             }
         });
 
@@ -995,21 +998,21 @@ impl <'a>NormNet <'a>{
         println!("selection_threshold: {}", selection_threshold);
 
         // now select with selection_pressure a network based on fitness
-        let (res, dir, deserialized_network) = targets.into_iter().filter(|(lowest_error, _, _)| {
-            //TODO: rework this
+        let (dir, serialized_network) = targets.into_iter().filter(|(dir, serialized_network)| {
             println!("selection limiter: {}", selection_threshold);
-            selection > lowest_error.clone()
+            selection > serialized_network.lowest_error.clone()
         })
-        .inspect(|(lowest_error, dir, _)| {
-            println!("choosing from: {} {:?}", lowest_error, dir);
+        .inspect(|(dir, serialized_network)| {
+            println!("choosing from: {} {:?}", serialized_network.lowest_error, dir);
         })
         .choose(&mut r).context("no checkpoint found")?;
+
         //TODO: search the tree for diversity either by looking at the expected future reward of a node (unique traces to unique frontier nodes) 
         //      or searching as horizontally as possible from the current checkpoint node with fitness pressure
 
-        println!("loading network with fitness: {:?}", res);
+        println!("loading network with fitness: {:?}", serialized_network.lowest_error);
         self.load(dir)?;
-        deserialized_network.restore(self);
+        serialized_network.restore(self);
         // TODO: if Root node is selected, reinitialize all variables for random seed of network to ensure robust search
 
         Ok(())
