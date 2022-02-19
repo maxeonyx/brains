@@ -23,6 +23,7 @@ itertools = "0.10.3"
 uuid = { version = "0.8.2", features = ["v4"] }
 serde_json = "1.0.79"
 anyhow = "1.0.53"
+rayon = "1.5.1"
 # windows = { version = "0.26.0", features = ["UI_Input_Preview_Injection", "Foundation_Collections", "build", "std"] }
 # windows_macros = "0.28.0"
 # winapi = "0.3.9"

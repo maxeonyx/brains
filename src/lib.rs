@@ -28,6 +28,9 @@ use std::result::Result;
 use anyhow::{Context};
 //TODO: clean this up with proper heirachy
 use rand::Rng;
+// include par_iter from rayon
+use rayon::iter::ParallelBridge;
+use rayon::prelude::*;
 use std::os;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -875,7 +878,6 @@ impl <'a>NormNet <'a>{
         let mut i = 0;
         let mut avg_t = vec![];
         //TODO: save the root node of search properly (if it doesnt exist)
-        // self.save(dir.clone())?;
         loop{
             // start a timer
             let start = Instant::now();
@@ -941,25 +943,27 @@ impl <'a>NormNet <'a>{
     ///stochastically select a model from dir with selection_pressure for the models fitness
     pub fn load_checkpoint_search(&mut self, selection_pressure: f32) -> Result<(), Box<dyn Error>> {
         assert!(selection_pressure >= 0.0 && selection_pressure <= 1.0, "selection_pressure must be between 0 and 1");
-        let files_iter = fs::read_dir(self.name)?;
+        println!("loading checkpointed models..");
+        let files_iter = fs::read_dir(self.name)?.par_bridge();
+        // .par_bridge();
+        // create an iterator from files_iter
 
         let mut r = rand::thread_rng();
+
         //TODO: extract this to helper functions to abstract the tree search operations and buffer/cache checkpoint_data from disk
         //TODO: rayon this becaus tree search
-        // let items: Vec<(f32, String, SerializedNetwork)> = 
-        let targets:HashMap<String, SerializedNetwork> = files_iter.filter(|dir|
+        let targets: HashMap<String, SerializedNetwork> = files_iter.filter(|dir|
             dir.as_ref().unwrap().path().is_dir())
             .map(|dir| {
                 let dir = dir.unwrap().path().to_str().unwrap().to_string();
                 // get the file "checkpoint_data" from inside directory and read the first line
                 let target = dir.clone()+r"\checkpoint_data.json";
-                println!("{}", target);
                 // same as above but with from_reader
-                let deserialized_network:SerializedNetwork = serde_json::from_reader(fs::File::open(target.clone()).unwrap()).unwrap();
+                let deserialized_network: SerializedNetwork = serde_json::from_reader(fs::File::open(target.clone()).unwrap()).unwrap();
                 // store the checkpoint data in the hashmap with directory as key
                 (dir.to_string(), deserialized_network)
         })
-        .inspect(|x| println!("{:?}", x.0)).collect();
+        .collect();
 
         // find the lowest error in targets
         let mut lowest_error = f32::MAX;
@@ -972,7 +976,7 @@ impl <'a>NormNet <'a>{
         // find the highest error in targets
         let mut highest_error = f32::MIN;
         // we filter f32::MAX which is root node and arbitrarily high
-        targets.iter().filter(|(dir, serialized_network)| serialized_network.lowest_error< f32::MAX).for_each(|(dir,serialized_network)| {
+        targets.iter().filter(|(dir, serialized_network)| serialized_network.lowest_error < f32::MAX).for_each(|(dir,serialized_network)| {
             if serialized_network.lowest_error > highest_error{
                 highest_error = serialized_network.lowest_error.clone();
             }
@@ -981,33 +985,30 @@ impl <'a>NormNet <'a>{
         // assert!(highest_error*selection_pressure > lowest_error, "selection_pressure must be greater than the lowest error");
         let total_range = rand::thread_rng().gen_range(lowest_error..highest_error);
         //TODO: this doesnt allow sampling above the median
-        // find the mean for the set {lowest_error,highest_error}
+        // find the mean for the set {lowest_error, highest_error}
         let mean= (highest_error-lowest_error)/2.0 + lowest_error;
         // now move the mean to lowest error by selection_pressure
         let highest_error= mean - selection_pressure*(highest_error-lowest_error)/2.0;
 
         let selection_threshold = rand::thread_rng().gen_range(lowest_error..highest_error);
 
-        let mut selection = 0.0;
+        let selection;
         if total_range > selection_threshold {
             selection = total_range - selection_threshold;
         }else {
             selection = selection_threshold;
         }
 
-        println!("selection_threshold: {}", selection_threshold);
-
         // now select with selection_pressure a network based on fitness
         let (dir, serialized_network) = targets.into_iter().filter(|(dir, serialized_network)| {
-            println!("selection limiter: {}", selection_threshold);
             selection > serialized_network.lowest_error.clone()
         })
-        .inspect(|(dir, serialized_network)| {
-            println!("choosing from: {} {:?}", serialized_network.lowest_error, dir);
-        })
+        // .inspect(|(dir, serialized_network)| {
+        //     println!("choosing from: {} {:?}", serialized_network.lowest_error, dir);
+        // })
         .choose(&mut r).context("no checkpoint found")?;
 
-        //TODO: search the tree for diversity either by looking at the expected future reward of a node (unique traces to unique frontier nodes) 
+        //TODO: search the tree for diversity either by looking at the expected future reward of a node (number of unique paths to unique frontier nodes) 
         //      or searching as horizontally as possible from the current checkpoint node with fitness pressure
 
         println!("loading network with fitness: {:?}", serialized_network.lowest_error);
@@ -1110,21 +1111,29 @@ mod tests {
         let mut norm_net = NormNet::new("test_checkpoint",2, 1, 200, 96, 10, 10.0, 5 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
-        let mut inputs = Vec::new();
-        let mut outputs = Vec::new();
         // create entries for inputs and outputs of xor
-        for _ in 0..100 {
-            // instead of the above, generate either 0 or 1 and cast to f32
-            let input = vec![(rrng.gen::<u8>() & 1) as f32, (rrng.gen::<u8>() & 1) as f32];
-            let output = vec![(input[0] as u8 ^ input[1] as u8) as f32];
+        // for _ in 0..100 {
+        //     // instead of the above, generate either 0 or 1 and cast to f32
+        //     let input = vec![(rrng.gen::<u8>() & 1) as f32, (rrng.gen::<u8>() & 1) as f32];
+        //     let output = vec![(input[0] as u8 ^ input[1] as u8) as f32];
 
-            inputs.push(input);
-            outputs.push(output);
-        }
+        //     inputs.push(input);
+        //     outputs.push(output);
+        // }
         //TODO: window size and training_iterations is hyperparameter for arch search. they should exist in shared struct or function parameter 
         //TODO: how can we train this in RL? need to store window and selection_pressure in class state
         //TODO: this needs to happen on initialization
         for _ in 0..10{
+            let mut inputs = Vec::new();
+            let mut outputs = Vec::new();
+            for _ in 0..100 {
+                // instead of the above, generate either 0 or 1 and cast to f32
+                let input = vec![(rrng.gen::<u8>() & 1) as f32, (rrng.gen::<u8>() & 1) as f32];
+                let output = vec![(input[0] as u8 ^ input[1] as u8) as f32];
+
+                inputs.push(input);
+                outputs.push(output);
+            }
             // TEST TRAIN
             norm_net.train_checkpoint_search(inputs.clone(), outputs.clone(),  25).unwrap();
 
