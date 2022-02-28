@@ -64,6 +64,7 @@ use tensorflow::REGRESS_METHOD_NAME;
 use tensorflow::REGRESS_OUTPUTS;
 use uuid::Uuid;
 
+
 //TODO: this may be able to be abstracted into a high level NN crate that allows architecture development by
 //      passing layer in functionally then using the high level abstractions of NormNet (rename to ANN or something)
 //      build a seperate library of network architectures like tf.NN
@@ -71,6 +72,7 @@ use uuid::Uuid;
 
 //TODO: type errors for anything other than u64 architecture due to casts. 
 //      Also type errors for summing f32s which should accumulated to f64.
+//TODO: logging for effeciency
 
 /// A standard fully connected layer with bias term
 ///
@@ -218,106 +220,6 @@ fn norm_layer_res<O1: Into<Output>>(
     Ok((vec![w.clone()], res))
 }
 
-//TODO: @DEPRECATED
-/// Creates a fully connected network with normalizing layers.
-/// handles all type input and output in the graph, just pass in and expect floats
-/// best data wrangling practices are still recommended, especially normalizing each
-/// input between -1 > x > 1.
-///
-///# PARAMETERS:
-///
-/// * input_size: size of the input vector
-///
-/// * output_size: size of the output vector
-///
-/// * layer_width: number of nodes in each layer
-///
-/// * layer_height: number of layers in the network including input, hidden and output.
-///
-/// * max_integer: maximum integer value that can be represented by the output of the network
-///
-/// # RETURNS:
-/// * output vector from the network as a tensorflow-rs Output type
-///
-/// * vector of variables that are the weights of the network as tensorflow-rs Variable type
-///
-/// * input vector to the network as a tensorflow-rs Operation type
-///
-/// * output of the TF graph as a tensorflow-rs Operation type
-///
-/// * the passed in tensorflow-rs mutable scope with the network added as a TF graph
-pub fn norm_net(
-    scope: &mut Scope,
-    input_size: u64,
-    output_size: u64,
-    layer_width: u64,
-    layer_height: u64,
-    max_integer: u32,
-) -> Result<(Vec<Output>, Vec<Variable>, Operation, Operation, &mut Scope), Status> {
-    //TODO: pass in optimizer or just hyperparams?
-    //TODO: this may be better served as a builder; or factory for a keras like set of layers
-    let input = ops::Placeholder::new()
-        .dtype(DataType::Float)
-        .shape([1u64, input_size])
-        .build(&mut scope.with_op_name("input"))?;
-    let label = ops::Placeholder::new()
-        .dtype(DataType::Float)
-        .shape([1u64, output_size])
-        .build(&mut scope.with_op_name("label"))?;
-
-    let mut net_vars = vec![];
-    let mut net_layers = vec![];
-
-    //initial layer
-    let (vars, layer, _) = norm_layer(
-        input.clone(),
-        input_size,
-        layer_width,
-        &|x, scope| Ok(ops::tanh(x, scope)?.into()),
-        scope,
-    )?;
-    net_vars.extend(vars);
-    net_layers.push(layer.clone());
-
-    let mut prev_layer = layer;
-    //hidden layers
-    for i in 0..layer_height - 2 {
-        let (vars, layer, _) = norm_layer(
-            prev_layer.clone(),
-            layer_width,
-            layer_width,
-            //NOTE: originally designed with tan but vanishing gradient can occur
-            &|x, scope| Ok(ops::tanh(x, scope)?.into()),
-            scope,
-        )?;
-        prev_layer = layer.clone();
-
-        net_vars.extend(vars);
-        net_layers.push(layer.clone());
-    }
-
-    //the final output layer is tanh to express negative values and multiplied to stabilize the
-    //half precision gradient as well as express whole integers outside of -1 and 1.
-    let (vars, output, _) = norm_layer(
-        net_layers.last().unwrap().clone(),
-        layer_width,
-        output_size,
-        &|x, scope| {
-            Ok(ops::multiply(
-                ops::tanh(x, scope)?,
-                //TODO: extract this scalar coefficient
-                ops::constant(max_integer as f32, scope)?,
-                scope,
-            )?
-            .into())
-        },
-        scope,
-    )?;
-    net_vars.extend(vars);
-    net_layers.push(output);
-
-    Ok((net_layers, net_vars, input, label, scope))
-}
 
 //TODO: defaults such as learning rate
 //================
@@ -567,16 +469,14 @@ impl <'a>NormNet <'a>{
             evaluation_window,
             checkpoint_name: None,
         };
-        //TODO: refactor dir to self.name
+
+        //initialize NormNet save directory
         fs::create_dir_all(init_norm_net.name).unwrap();
         init_norm_net.save().unwrap();
+
         Ok(init_norm_net)
     }
 
-    // forward pass and return result
-    // fn infer
-    //one time traning that can take output of infer and a label
-    // fn backprop
 
     /// save variables that arent in the Tensorflow graph that are needed for checkpointing
     /// this stores edge information about which checkpoints resulted in which for informed 
@@ -1018,6 +918,54 @@ impl <'a>NormNet <'a>{
 
         Ok(())
     }
+    /// forward pass and return the output of the network.
+    pub fn infer<T: tensorflow::TensorType>(&self, inputs: Tensor<f32>)-> Result<Tensor<T>, Box<dyn Error>>{
+        let mut run_args = SessionRunArgs::new();
+        let output = run_args.request_fetch(&self.Output_op, 0);
+        run_args.add_feed(&self.Input, 0, &inputs);
+
+        self.session.run(&mut run_args)?;
+
+        let output: Tensor<T> = run_args.fetch(output)?;
+        Ok(output)
+    }
+
+    /// takes the given inputs and fitness function and backprops the network. if the fitness is less than 
+    /// sparse_threshold, the output is stored and backpropagated later when the fitness is above threshold
+    pub fn evaluate<T: tensorflow::TensorType>(&mut self, labels: Vec<T>)-> Result<Tensor<f32>, Box<dyn Error>>{
+        let mut label_tensor: Tensor<T> = Tensor::new(&[1u64, labels.len() as u64]);
+        // now assign the input and label to the tensor
+        // for i in 0..inputs.len() {
+        //     input_tensor[i] = inputs[i].clone();
+        // }
+        for i in 0..labels.len() {
+            label_tensor[i] = labels[i].clone();
+        }
+
+        let mut run_args = SessionRunArgs::new();
+        run_args.add_target(&self.minimize);
+
+        //TODO: this needs to be forward proped first. conditionally backprop so feeds are initialized.
+        //TODO: pass in a function that maps output to label
+        //TODO: sparse reward (variable episodic automation) buffering goes here 
+        let error_squared_fetch = run_args.request_fetch(&self.Error, 0);
+        // let output = run_args.request_fetch(&self.Output_op, 0);
+        run_args.add_feed(&self.Label, 0, &label_tensor);
+        self.session.run(&mut run_args)?;
+
+        let res: Tensor<f32> = run_args.fetch(error_squared_fetch)?;
+        // let output: Tensor<T> = run_args.fetch(output)?;
+
+        // println!(
+        //     "training on {}\n input: {:?} label: {:?} error: {} output: {} seconds/epoch: {:?}",
+        //     i, input, label, res, output,average 
+        // );
+        //TODO: evaluation_window_size should be in class state
+        self.register_error(res.clone(), 0);
+
+        Ok(res)
+    }
+
 }
 
 #[cfg(test)]
@@ -1112,14 +1060,6 @@ mod tests {
         //TRAIN//
         let mut rrng = rand::thread_rng();
         // create entries for inputs and outputs of xor
-        // for _ in 0..100 {
-        //     // instead of the above, generate either 0 or 1 and cast to f32
-        //     let input = vec![(rrng.gen::<u8>() & 1) as f32, (rrng.gen::<u8>() & 1) as f32];
-        //     let output = vec![(input[0] as u8 ^ input[1] as u8) as f32];
-
-        //     inputs.push(input);
-        //     outputs.push(output);
-        // }
         //TODO: window size and training_iterations is hyperparameter for arch search. they should exist in shared struct or function parameter 
         //TODO: how can we train this in RL? need to store window and selection_pressure in class state
         //TODO: this needs to happen on initialization
@@ -1140,6 +1080,20 @@ mod tests {
             // TEST LOAD
             norm_net.load_checkpoint_search(0.001).unwrap();
 
+        }
+    }
+    #[test]
+    fn test_infer(){
+        println!("test_inference");
+        use crate::*;
+        //CONSTRUCTION//
+        let mut norm_net = NormNet::new("test_inference",2, 1, 200, 96, 10, 10.0, 5 as f32).unwrap();
+        //TRAIN//
+        let mut rrng = rand::thread_rng();
+        // create entries for inputs and outputs of xor
+        for _ in 0..10{
+            let mut inputs:Tensor<f32> = Tensor::new(&[1u64, 2 as u64]);
+            let res: Tensor<f32>= norm_net.infer(inputs).unwrap();
         }
     }
 }
