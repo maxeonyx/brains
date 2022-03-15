@@ -1,3 +1,17 @@
+# Brains
+NOTE: this project is very early and was spawned from my own architecture research. contributions, opinions and issues are very welcome!
+
+an Artificial Neural Network framework built on Tensorflow-rs bindings for creating architectures similar to keras but also with direct integration for custom layers in low level Tensorflow. Includes native checkpointing, inference, batch trainning and iterative trainning. See the unittests to get an idea of how things are called until documentation is created. Also ensure to enable the GPU flag for tensorflow if you want to offload computation.
+
+Currently all inputs and outputs are represented as flattend 1D rust Vecs.
+
+#TODO: 
+add more generic typing, currently f32 for parameters and u64 for architecture size is standard.
+add more layers
+add a form of N dimensional convolution that maps to the 1D input vectors and hidden layers 
+formalize documentation for layers (unscaled architectures) as seen below.
+
+Architectures
 # NormNet
 Research in Neural Networks without bias and gradient based connection dropout by utilizing per node normalization.
 
