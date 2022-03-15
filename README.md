@@ -5,7 +5,8 @@ an Artificial Neural Network framework built on Tensorflow-rs bindings for creat
 
 Currently all inputs and outputs are represented as flattend 1D rust Vecs.
 
-#TODO: 
+# TODO: 
+
 add more generic typing, currently f32 for parameters and u64 for architecture size is standard.
 
 add more layers
