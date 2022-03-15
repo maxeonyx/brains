@@ -1,13 +1,21 @@
-//! NormNet: a Deep Artificial Neural Network using normalizing neurons to investigate alternatives to bias
-//! based expressivity. Gradient based connection-wise dropout is also included due to the numeric properties
-//! inherent to normalization (thanks to a little trig and calculus). This allows NormNet to also be a sparse-searching
-//! "top down" architecture search where the parameters are recoverable thanks again to the gradient.
-//! It is hypothesized and investigated here that the aforementioned features will lead to much more robust transfer
-//! learning and therein generalization. The only significant downsides to this is a division by constant operation on each node
-//! (seemingly/empirically not as bad as it sounds).
+//  NormNet: a Deep Artificial Neural Network using normalizing neurons to investigate alternatives to bias
+//  based expressivity. Gradient based connection-wise dropout is also included due to the numeric properties
+//  inherent to normalization (thanks to a little trig and calculus). This allows NormNet to also be a sparse-searching
+//  "top down" architecture search where the parameters are recoverable thanks again to the gradient.
+//  It is hypothesized and investigated here that the aforementioned features will lead to much more robust transfer
+//  learning and therein generalization. The only significant downsides to this is a division by constant operation on each node
+//  (seemingly/empirically not as bad as it sounds).
 
 //TODO: allow this to fallback to TF-CPU for machines without GPU and possibly just do inference with a build script.
-//TODO: floats stink norm net is an attempt to realizing rot net and uint8 operations with bounded functions while retaining all the flaws in DNNs..
+//TODO: floats stink norm net is an attempt to realizing rot net and uint8 operations with bounded functions while retaining all the flaws in DNNs.. (go back to rot net at some point)
+//TODO: rayon all the things
+//TODO: extract layers to layers.rs and upload to crates.io with example of how to implement an architecture
+
+//TODO: type errors for anything other than u64 architecture due to casts. 
+//      Also precision errors for summing f32s which should accumulate to f64.
+//TODO: logging for effeciency, SED println! to a logging crate since stdout logs are already formatted well
+//NOTE: DONE WITH FEATURES. this is a basic layers based tensorflow backed ANN architecture framework. 
+//      Anything else should be written outside this crate and integrated only if general enough.
 
 //allow unstable features
 // #![feature(int_log)]
@@ -64,23 +72,12 @@ use tensorflow::REGRESS_METHOD_NAME;
 use tensorflow::REGRESS_OUTPUTS;
 use uuid::Uuid;
 
-
-//TODO: this may be able to be abstracted into a high level NN crate that allows architecture development by
-//      passing layer in functionally then using the high level abstractions of NormNet (rename to ANN or something)
-//      build a seperate library of network architectures like tf.NN
-//TODO: extract layers to layers.rs
-
-//TODO: type errors for anything other than u64 architecture due to casts. 
-//      Also type errors for summing f32s which should accumulated to f64.
-//TODO: logging for effeciency
-
 /// A standard fully connected layer with bias term
 ///
 /// `activation` is a function which takes a tensor and applies an activation
 /// function such as sigmoid.
 ///
 /// Returns variables created and the layer output.
-///
 fn layer<O1: Into<Output>>(
     input: O1,
     input_size: u64,
@@ -219,8 +216,6 @@ fn norm_layer_res<O1: Into<Output>>(
     // Ok((vec![w.clone(), w_res.clone()], res))
     Ok((vec![w.clone()], res))
 }
-
-
 //TODO: defaults such as learning rate
 //================
 //----NORM_NET----
@@ -265,8 +260,7 @@ fn norm_layer_res<O1: Into<Output>>(
 /// greater than Float range we are fine in the worst case (summing all 1's).
 /// Otherwise decimal precision of float type is our parameter type precision.
 pub struct NormNet<'a> {
-    //TODO: this is getting rather large, how can this be refactored? functionally? builders and defaults
-    //TODO: checkpoint based stuff is a meta-learner, consider extracting to a seperate object for organization (SerializedNetwork)
+    //TODO: refactor with builder pattern for RL, checkpointing and feedback network once tested and working.
     /// Tensorflow objects for user abstraction from Tensorflow
     scope: Scope,
     session: Session,
@@ -291,8 +285,19 @@ pub struct NormNet<'a> {
     ///the highest score achieved (lowest error) as a sum of the error vector. 
     ///initialized to -1 since error can never be negative.
     lowest_error: f32,
+    //TODO: checkpoint_window_size may be better as a slice again
+    ///the error power for scaling the error gradient's pressure on the weights
+    error_power: f32,
     ///the moving average window of labels trained on before the score is evaluated
-    evaluation_window: Vec<f32>,
+    checkpoint_window: Vec<f32>,
+    //TODO: should these be setters if not in constructor? lazy instantiation? yes
+    //TODO: Option<checkpoint_window_size>
+    //TODO: if we have sparse_state_buffer we should just calculate checkpoint_window
+    //TODO: rename to indicate this is outputs not errors
+    //TODO: should this also keep each error in the buffer or just use fractional sparse_reward? 
+    //      Keep it simple for now, justify proportional error in sparse_state_buffer empirically.
+    //stored inputs and outputs of the network for RL based experience replay.
+
     ///the current name of the checkpoint being searched
     checkpoint_name: Option<String>,
 }
@@ -305,7 +310,8 @@ struct SerializedNetwork{
     parent_search_name: String,
     checkpoint_name: Option<String>,
     lowest_error: f32,
-} impl SerializedNetwork{
+} 
+impl SerializedNetwork{
     /// Constructs a new serialized network from a checkpoint name and the lowest error
     fn new(parent_search_name: String, checkpoint_name: Option<String>, lowest_error: f32) -> Self{
         Self{
@@ -347,6 +353,7 @@ impl <'a>NormNet <'a>{
             .build(&mut scope.with_op_name("label"))?;
 
         //CONSTRUCT NETWORK
+        //TODO: EXTRACT THIS TO LAYERS.RS. THIS IS ALL THATS NEEDED TO MAKE THIS AN ARCHITECTURE DESIGN CRATE.
         let mut net_vars = vec![];
         let mut net_layers = vec![];
 
@@ -397,6 +404,7 @@ impl <'a>NormNet <'a>{
         net_vars.extend(vars);
         net_layers.push(output.clone());
         //END OF CONSTRUCTING NETWORK
+        //TODO: END OF EXTRACTION
 
         let Output = output;
 
@@ -413,6 +421,8 @@ impl <'a>NormNet <'a>{
         //TODO: pass this in conditionally, give user output and label with
         //      a partial constructor then they supply error and construction is complete
         //      two structs? whats standard functionally for partial construction?
+        //  ^this is important for reinforcement learning where label difference should be output gradient direction (multiplication)
+        //TODO: use setters instead and have a default object behaviour.
 
         //default error is pythagorean distance
         let Error = ops::sqrt(
@@ -430,7 +440,7 @@ impl <'a>NormNet <'a>{
         )?;
 
         let mut lowest_error = f32::MAX;
-        let mut evaluation_window = vec![];
+        let mut checkpoint_window = vec![];
 
         let (minimize_vars, minimize) = optimizer
             .minimize(
@@ -462,11 +472,12 @@ impl <'a>NormNet <'a>{
             Label,
             Output_op,
             Error,
+            error_power,
             minimize_vars,
             minimize,
             SavedModelSaver,
             lowest_error,
-            evaluation_window,
+            checkpoint_window,
             checkpoint_name: None,
         };
 
@@ -513,35 +524,55 @@ impl <'a>NormNet <'a>{
     }
 
     /// stores the average error in self.lowest error if it is lower than the current lowest 
-    /// average error and evaluation window is full, otherwise push error into evaluation_window buffer.
-    fn register_error(&mut self, error: Tensor<f32>, evaluation_window_size: u64) -> bool{
-        let mut result = false;
+    /// average error and evaluation window is full, otherwise push error into checkpoint_window buffer.
+    fn checkpoint_error(&mut self, error: Tensor<f32>, checkpoint_window_size: u64) ->  Result<(), Box::<dyn Error>>{
+        // checkpoint window size must be > 0
+        assert!(checkpoint_window_size > 0, "checkpoint_window_size must be > 0");
+        // let mut result = false;
 
-        let error_sum = error.iter().fold(0.0, |acc, x| acc + x);
-        self.evaluation_window.push(error_sum);
+        // println!("lowest error: {}", self.lowest_error);
+        // print window length and checkpoint_window_size
 
-        println!("error sum: {}", error_sum);
-        println!("lowest error: {}", self.lowest_error);
-        // print window length and evaluation_window_size
-        println!("window length: {}", self.evaluation_window.len());
-        println!("evaluation_window_size: {}", evaluation_window_size);
+        // println!("window length: {}", self.checkpoint_window.len());
+        // println!("checkpoint_window_size: {}", checkpoint_window_size);
+        //TODO: should we use checkpoint window size? there is a possibility of destroying the 
+        //      best error in the window and still representing the now diverged solution.
+        // the latent aspect of the gradient makes the solution still viable. it is "near" the 
+        // solution by worst case radius(checkpoint_windw_size).
+        // 
+        // greedy checkpointing of epsilon > fitness is also great for sharp ridges in fitness landscape. this would be checkpoint window of 1.
+        // checkpoint_window, as the name implies, can be modeled as a smoothing/clustering function.
 
-        if self.evaluation_window.len() >= evaluation_window_size as usize {
-            println!("evaluation window is full");
-            // average evaluation_window (dont need to divide since always comparing this value relatively) but we do so for more intuitive metrics relative to per column error
-            let avg = self.evaluation_window.iter().fold(0.0, |acc, x| acc + x)/ self.evaluation_window.len() as f32;
-            print!("avg: {}", avg);
-            println!(" vs lowest error: {}", self.lowest_error);
-            if self.lowest_error > avg || self.lowest_error == -1.0 as f32 {
-                println!("new lowest error: {}", avg);
+        if self.checkpoint_window.len() >= checkpoint_window_size as usize {
+            // println!("evaluation window is full");
+            // average checkpoint_window (dont need to divide since always comparing this value relatively) but we do so for more intuitive metrics relative to per column error
+            let avg = self.checkpoint_window.iter().fold(0.0, |acc, x| acc + x)/ self.checkpoint_window.len() as f32;
+            // print!("avg: {}", avg);
+            // println!(" vs lowest error: {}", self.lowest_error);
+
+            // this will probably get LICM'd anyways:
+            let error_sum = error.iter().fold(0.0, |acc, x| acc + x)/error.len() as f32;
+            self.checkpoint_window.push(error_sum);
+
+            // println!("error sum: {}", error_sum);
+            if self.lowest_error > avg {
+                println!("NEW LOWEST ERROR: {}", avg);
                 self.lowest_error = avg;
-                result = true;
+                println!("checkpointing..");
+                self.save()?;
+                println!("new best score: {:?}", self.lowest_error);
             }
-            // process the evaluation_window buffer
-            self.evaluation_window.clear();
+            // process the checkpoint_window buffer
+            self.checkpoint_window.clear();
+        }else{
+            // only push the current error
+            let error_sum = error.iter().fold(0.0, |acc, x| acc + x)/error.len() as f32;
+            self.checkpoint_window.push(error_sum);
 
+            println!("error sum: {}", error_sum);
         }
-        result
+        // return Ok with Box dyn error
+        Ok(())
     }
 
     //TODO: include name score etc in serialization here (can just write to the directory created)
@@ -653,15 +684,24 @@ impl <'a>NormNet <'a>{
         self.minimize =
             graph.operation_by_name_required(&signature.get_input("minimize")?.name().name)?;
 
+        //TODO: clear sparse_state_buffer and checkpoint_window along with all other vars
+        self.checkpoint_window.clear();
+        self.lowest_error = std::f32::MAX;
+
         Ok(())
     }
 
-    /// train the network with the given inputs and labels (must be synchronized in index order)
-    ///PARAMETERS:
-    /// inputs: the inputs to the network as a flattened 1D vector
-    /// labels: the labels for the inputs as a flattened 1D vector, must align index wise with inputs. (e.g. inputs[0] must be labeled as labels[0])
-    /// error: the error operation to minimize with (e.g. pythagorean error sqrt(x^2 + y^2))
-    /// learning_rate: the learning rate for the network (e.g. 0.001)
+    /// Train the network with the given inputs and labels (must be synchronized in index order)
+    ///
+    ///**PARAMETERS**:
+    /// 
+    /// * inputs: the inputs to the network as a flattened 1D vector
+    /// 
+    /// * labels: the labels for the inputs as a flattened 1D vector, must align index wise with inputs. (e.g. inputs[0] must be labeled as labels[0])
+    /// 
+    /// * error: the error operation to minimize with (e.g. pythagorean error sqrt(x^2 + y^2))
+    /// 
+    /// * learning_rate: the learning rate for the network (e.g. 0.001)
     pub fn train<T: tensorflow::TensorType>(
         // &mut self,
         &mut self,
@@ -736,7 +776,8 @@ impl <'a>NormNet <'a>{
                 "training on {}\n input: {:?} label: {:?} error: {} output: {} seconds/epoch: {:?}",
                 i, input, label, res, output,average 
             );
-            self.register_error(res.clone(), 0);
+            //TODO: we dont need to call this here? this is exclusively for checkpointing
+            // self.checkpoint_error(res.clone(), 0);
 
             result.push(res);
         }
@@ -748,12 +789,13 @@ impl <'a>NormNet <'a>{
     //TODO: search iterations should see different datasets/epochs of dataset (not actual epoch backprop) via k-folding
     //      also cross validate the k-fold
     //TODO: dataset structure with methods to yield k-fold and assertions for inputs and labels
+    //TODO: checkpoint selection should be modular so a neural network or other intelligent statistical model can be apllied easily instead of.. this..
 
     ///trains on the given inputs and labels until search_iterations have been completed.
     ///if the network scores higher than delta_loss, the network is checkpointed 
     ///(serialized and saved to the given directory).
-    pub fn train_checkpoint_search<T: tensorflow::TensorType>(&mut self, inputs: Vec<Vec<T>>, labels: Vec<Vec<T>>, evaluation_window_size: u64) -> Result<(), Box<dyn Error>> {
-        assert!(evaluation_window_size < inputs.len() as u64, "evaluation window size must be less than input/output data");
+    pub fn train_checkpoint_search<T: tensorflow::TensorType>(&mut self, inputs: Vec<Vec<T>>, labels: Vec<Vec<T>>, checkpoint_window_size: u64) -> Result<(), Box<dyn Error>> {
+        assert!(checkpoint_window_size < inputs.len() as u64, "evaluation window size must be less than input/output data");
 
         let mut input_tensor: Tensor<T> = Tensor::new(&[1u64, inputs[0].len() as u64]);
         let mut label_tensor: Tensor<T> = Tensor::new(&[1u64, labels[0].len() as u64]);
@@ -826,18 +868,12 @@ impl <'a>NormNet <'a>{
                 i, input, label, res, output,average 
             );
 
-            let best_score = self.register_error(res.clone(), evaluation_window_size);
-            if best_score {
-                println!("checkpointing..");
-                self.save()?;
-                println!("new best score: {:?}", self.lowest_error);
-            }
+            self.checkpoint_error(res.clone(), checkpoint_window_size)?;
         }
 
         Ok(())
     }
 
-    //TODO: load_checkpoint_search
     //stochastically (with 'selection_pressure=n' for fitness) select checkpointed models 
     //and save them if they are 'delta_fitness=x' above the previous lowest_error
     ///stochastically select a model from dir with selection_pressure for the models fitness
@@ -851,7 +887,7 @@ impl <'a>NormNet <'a>{
         let mut r = rand::thread_rng();
 
         //TODO: extract this to helper functions to abstract the tree search operations and buffer/cache checkpoint_data from disk
-        //TODO: rayon this becaus tree search
+        //TODO: rayon this because tree search
         let targets: HashMap<String, SerializedNetwork> = files_iter.filter(|dir|
             dir.as_ref().unwrap().path().is_dir())
             .map(|dir| {
@@ -867,22 +903,25 @@ impl <'a>NormNet <'a>{
 
         // find the lowest error in targets
         let mut lowest_error = f32::MAX;
-        targets.iter().filter(|(dir, serialized_network)| serialized_network.lowest_error > 0.0)
+        targets.iter()
+        .filter(|(dir, serialized_network)| serialized_network.lowest_error > 0.0)
         .for_each(|(dir, serialized_network)| {
             if serialized_network.lowest_error < lowest_error{
                 lowest_error = serialized_network.lowest_error;
             }
         });
         // find the highest error in targets
-        let mut highest_error = f32::MIN;
-        // we filter f32::MAX which is root node and arbitrarily high
-        targets.iter().filter(|(dir, serialized_network)| serialized_network.lowest_error < f32::MAX).for_each(|(dir,serialized_network)| {
+        let mut highest_error = 0.0;
+        // we filter f32::MAX which is root node 
+        //TODO: dont filter root node, handle otherwise (reseed the var parameter initialization)
+        targets.iter()
+        .filter(|(dir, serialized_network)| serialized_network.lowest_error < f32::MAX)
+        .for_each(|(dir,serialized_network)| {
             if serialized_network.lowest_error > highest_error{
                 highest_error = serialized_network.lowest_error.clone();
             }
         });
 
-        // assert!(highest_error*selection_pressure > lowest_error, "selection_pressure must be greater than the lowest error");
         let total_range = rand::thread_rng().gen_range(lowest_error..highest_error);
         //TODO: this doesnt allow sampling above the median
         // find the mean for the set {lowest_error, highest_error}
@@ -919,7 +958,7 @@ impl <'a>NormNet <'a>{
         Ok(())
     }
     /// forward pass and return the output of the network.
-    pub fn infer<T: tensorflow::TensorType>(&self, inputs: Tensor<f32>)-> Result<Tensor<T>, Box<dyn Error>>{
+    pub fn infer<T: tensorflow::TensorType>(&self, inputs: Tensor<T>)-> Result<Tensor<T>, Box<dyn Error>>{
         let mut run_args = SessionRunArgs::new();
         let output = run_args.request_fetch(&self.Output_op, 0);
         run_args.add_feed(&self.Input, 0, &inputs);
@@ -930,44 +969,66 @@ impl <'a>NormNet <'a>{
         Ok(output)
     }
 
-    /// takes the given inputs and fitness function and backprops the network. if the fitness is less than 
-    /// sparse_threshold, the output is stored and backpropagated later when the fitness is above threshold
-    pub fn evaluate<T: tensorflow::TensorType>(&mut self, labels: Vec<T>)-> Result<Tensor<f32>, Box<dyn Error>>{
-        let mut label_tensor: Tensor<T> = Tensor::new(&[1u64, labels.len() as u64]);
+    /// Online reinforcement learning method.
+    /// 
+    /// Takes the given inputs and fitness function and backprops the network once, 
+    /// returning the output output vector. 
+    /// This should be called as an online (realtime) reinforcment learning technique 
+    /// where labels can be formed given a fitness function.
+    /// 
+    ///PARAMETERS:
+    /// returns the output from the network for online learning implementation.
+    ///
+    /// Fitness function takes a 1D tensor of length output and returns a label tensor of same shape.
+    pub fn evaluate(
+        &mut self, 
+        inputs: Vec<f32>, 
+        checkpoint_window_size: u64,
+        //TODO: make this internal to class as builder so we dont clone the dyn ref alot ITL
+        //TODO: refactor the names here to make this more intuitive
+        fitness_function: Box<dyn Fn(&Tensor<f32>)->Tensor<f32>>) -> Result<Tensor<f32>, Box<dyn Error>>{
+
+        // let mut label_tensor: Tensor<T> = Tensor::new(&[1u64, labels.len() as u64]);
         // now assign the input and label to the tensor
-        // for i in 0..inputs.len() {
-        //     input_tensor[i] = inputs[i].clone();
-        // }
-        for i in 0..labels.len() {
-            label_tensor[i] = labels[i].clone();
+        let mut input_tensor = Tensor::new(&[1u64, inputs.len() as u64]);
+        for i in 0..inputs.len() {
+            input_tensor[i] = inputs[i].clone();
         }
 
+        // call infer to get the output
+        let outputs = self.infer(input_tensor.clone())?;
+
+        //create labels using fitness function
+        let reward= fitness_function(&outputs);
+
+        //backprop
         let mut run_args = SessionRunArgs::new();
         run_args.add_target(&self.minimize);
 
-        //TODO: this needs to be forward proped first. conditionally backprop so feeds are initialized.
-        //TODO: pass in a function that maps output to label
-        //TODO: sparse reward (variable episodic automation) buffering goes here 
+        //TODO: sparse reward (variable episodic automation) buffering goes here if implemented
         let error_squared_fetch = run_args.request_fetch(&self.Error, 0);
-        // let output = run_args.request_fetch(&self.Output_op, 0);
-        run_args.add_feed(&self.Label, 0, &label_tensor);
+        // set output feed manually
+        //TODO: runtime says we need to feed input again so create a placeholder tensor of 0
+        run_args.add_feed(&self.Input, 0, &input_tensor);
+        // run_args.add_feed(&self.Output_op, 0, &outputs);
+        //TODO: need to pass in the expected future reward as the label
+        run_args.add_feed(&self.Label, 0, &reward);
         self.session.run(&mut run_args)?;
 
-        let res: Tensor<f32> = run_args.fetch(error_squared_fetch)?;
-        // let output: Tensor<T> = run_args.fetch(output)?;
+        let cur_error: Tensor<f32> = run_args.fetch(error_squared_fetch)?;
 
-        // println!(
-        //     "training on {}\n input: {:?} label: {:?} error: {} output: {} seconds/epoch: {:?}",
-        //     i, input, label, res, output,average 
-        // );
-        //TODO: evaluation_window_size should be in class state
-        self.register_error(res.clone(), 0);
+        self.checkpoint_error(cur_error.clone(), checkpoint_window_size)?;
 
-        Ok(res)
+        //return the output
+        Ok(outputs.clone())
     }
+    //TODO: feedback network and rework name
+    //TODO: feedback network may need some inheritance or builder pattern constructor
+    // pub fn feedback_sequence_evaluate()
 
 }
 
+//TODO: add assertions for more than just runtime error.
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1063,10 +1124,10 @@ mod tests {
         //TODO: window size and training_iterations is hyperparameter for arch search. they should exist in shared struct or function parameter 
         //TODO: how can we train this in RL? need to store window and selection_pressure in class state
         //TODO: this needs to happen on initialization
-        for _ in 0..10{
+        for _ in 0..15{
             let mut inputs = Vec::new();
             let mut outputs = Vec::new();
-            for _ in 0..100 {
+            for _ in 0..10 {
                 // instead of the above, generate either 0 or 1 and cast to f32
                 let input = vec![(rrng.gen::<u8>() & 1) as f32, (rrng.gen::<u8>() & 1) as f32];
                 let output = vec![(input[0] as u8 ^ input[1] as u8) as f32];
@@ -1075,11 +1136,10 @@ mod tests {
                 outputs.push(output);
             }
             // TEST TRAIN
-            norm_net.train_checkpoint_search(inputs.clone(), outputs.clone(),  25).unwrap();
+            norm_net.train_checkpoint_search(inputs.clone(), outputs.clone(),  2).unwrap();
 
             // TEST LOAD
             norm_net.load_checkpoint_search(0.001).unwrap();
-
         }
     }
     #[test]
@@ -1094,6 +1154,38 @@ mod tests {
         for _ in 0..10{
             let mut inputs:Tensor<f32> = Tensor::new(&[1u64, 2 as u64]);
             let res: Tensor<f32>= norm_net.infer(inputs).unwrap();
+        }
+    }
+    #[test]
+    fn test_evaluate(){
+        println!("test_evaluate");
+        use crate::*;
+        //CONSTRUCTION//
+        let mut norm_net = NormNet::new("test_evaluate",2, 1, 200, 96, 10, 1.0, 10 as f32).unwrap();
+        //TRAIN//
+        let mut rrng = rand::thread_rng();
+
+        //TODO: this doesnt make much sense since we arent implementing state-action-reward tables 
+        let fitness_function = Box::new(|outputs: &Tensor<f32>| -> Tensor<f32> {
+            //TODO: which scalars in the output vector do we want to maximize? a good default fitness function 
+            //      is a scalar constant to each entry in the vector or power term.
+            //pass a function with a derivative that goes to zero or 1?
+            let mut res_tensor = Tensor::new(outputs.dims());
+            res_tensor[0] = outputs[0]/outputs[0];
+            res_tensor
+        });
+        // create entries for inputs and outputs of xor
+        for _ in 0..10{
+            // same as above but push a vec with two random floats
+            let inputs = vec![(rrng.gen::<f32>()), (rrng.gen::<f32>())];
+            let res: Tensor<f32> =  norm_net.evaluate(inputs, 1, fitness_function.clone()).unwrap();
+        }
+
+        //SEARCH RECOVERED MODEL:
+        norm_net.load_checkpoint_search(0.001).unwrap();
+        for _ in 0..10{
+            let inputs = vec![(rrng.gen::<f32>()), (rrng.gen::<f32>())];
+            let res: Tensor<f32> =  norm_net.evaluate(inputs, 1, fitness_function.clone()).unwrap();
         }
     }
 }
