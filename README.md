@@ -15,8 +15,8 @@ add a form of N dimensional convolution that maps to the 1D input vectors and hi
 
 formalize documentation for layers (unscaled architectures) as seen below.
 
-Architectures
-# NormNet
+# Architectures
+## NormNet
 Research in Neural Networks without bias and gradient based connection dropout by utilizing per node normalization.
 
 It is hypothesized that neural networks struggle with transfer learning due to biases limiting their exploration of other local minimas.
