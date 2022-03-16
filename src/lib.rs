@@ -1,6 +1,6 @@
-//  NormNet: a Deep Artificial Neural Network using normalizing neurons to investigate alternatives to bias
+//  Brain: a Deep Artificial Neural Network using normalizing neurons to investigate alternatives to bias
 //  based expressivity. Gradient based connection-wise dropout is also included due to the numeric properties
-//  inherent to normalization (thanks to a little trig and calculus). This allows NormNet to also be a sparse-searching
+//  inherent to normalization (thanks to a little trig and calculus). This allows Brain to also be a sparse-searching
 //  "top down" architecture search where the parameters are recoverable thanks again to the gradient.
 //  It is hypothesized and investigated here that the aforementioned features will lead to much more robust transfer
 //  learning and therein generalization. The only significant downsides to this is a division by constant operation on each node
@@ -13,12 +13,13 @@
 
 //TODO: type errors for anything other than u64 architecture due to casts. 
 //      Also precision errors for summing f32s which should accumulate to f64.
-//TODO: logging for effeciency, SED println! to a logging crate since stdout logs are already formatted well
+//TODO: logging for effeciency, SED log::debug! to a logging crate since stdout logs are already formatted well
 //NOTE: DONE WITH FEATURES. this is a basic layers based tensorflow backed ANN architecture framework. 
 //      Anything else should be written outside this crate and integrated only if general enough.
 
 //allow unstable features
 // #![feature(int_log)]
+use log;
 use serde::{Serialize, Deserialize};
 use serde_derive::{Serialize, Deserialize};
 use serde_json::{Value};
@@ -259,7 +260,7 @@ fn norm_layer_res<O1: Into<Output>>(
 /// In all other operations we are strictly bounded -1 > x > 1. As long as layer_width is not
 /// greater than Float range we are fine in the worst case (summing all 1's).
 /// Otherwise decimal precision of float type is our parameter type precision.
-pub struct NormNet<'a> {
+pub struct Brain<'a> {
     //TODO: refactor with builder pattern for RL, checkpointing and feedback network once tested and working.
     /// Tensorflow objects for user abstraction from Tensorflow
     scope: Scope,
@@ -320,14 +321,14 @@ impl SerializedNetwork{
             lowest_error,
         }
     }
-    fn restore(self, norm_net: &mut NormNet) {
-        // let mut NormNet = NormNet.clone();
+    fn restore(self, norm_net: &mut Brain) {
+        // let mut Brain = Brain.clone();
         norm_net.checkpoint_name = self.checkpoint_name;
         norm_net.lowest_error = self.lowest_error;
-        // NormNet
+        // Brain
     }
 }
-impl <'a>NormNet <'a>{
+impl <'a>Brain <'a>{
     //TODO: type safety: some of the meta-learning values should be 64 bit for overflow since we sum 32s etc.
     pub fn new(
         name: &'a str,
@@ -338,7 +339,7 @@ impl <'a>NormNet <'a>{
         max_integer: u32,
         learning_rate: f32,
         error_power: f32,
-    ) -> Result<NormNet<'a>, Status> {
+    ) -> Result<Brain<'a>, Status> {
         assert!(max_integer % 10 == 0 || max_integer == 1, "max_integer must be a multiple of 10 or 1 since it represents order of magnitude of the integer range");
         let mut scope = Scope::new_root_scope();
 
@@ -461,7 +462,7 @@ impl <'a>NormNet <'a>{
         }
         session.run(&mut run_args)?;
 
-        let mut init_norm_net = NormNet {
+        let mut init_norm_net = Brain {
             name,
             scope,
             session: session,
@@ -481,7 +482,7 @@ impl <'a>NormNet <'a>{
             checkpoint_name: None,
         };
 
-        //initialize NormNet save directory
+        //initialize Brain save directory
         fs::create_dir_all(init_norm_net.name).unwrap();
         init_norm_net.save().unwrap();
 
@@ -504,14 +505,14 @@ impl <'a>NormNet <'a>{
         // create a serialized_network object
         let serialized_network = SerializedNetwork{
             parent_search_name: name.clone(),
-            //TODO: see if we can remove this option in NormNet
+            //TODO: see if we can remove this option in Brain
             checkpoint_name: Some(dir.clone()),
             lowest_error: self.lowest_error,
         };
 
         //save the parent_search_name to dir which is where the model is saved, this is the edge to the checkpoint tree
         let file_name = format!("{}/checkpoint_data.json", dir);
-        println!("serializing non-tensorflow graph variables: {}", file_name);
+        log::debug!("serializing non-tensorflow graph variables: {}", file_name);
         // append the file type .j
         // create the file
         let mut file = fs::File::create(file_name.clone())?;
@@ -530,11 +531,11 @@ impl <'a>NormNet <'a>{
         assert!(checkpoint_window_size > 0, "checkpoint_window_size must be > 0");
         // let mut result = false;
 
-        // println!("lowest error: {}", self.lowest_error);
+        // log::debug!("lowest error: {}", self.lowest_error);
         // print window length and checkpoint_window_size
 
-        // println!("window length: {}", self.checkpoint_window.len());
-        // println!("checkpoint_window_size: {}", checkpoint_window_size);
+        // log::debug!("window length: {}", self.checkpoint_window.len());
+        // log::debug!("checkpoint_window_size: {}", checkpoint_window_size);
         //TODO: should we use checkpoint window size? there is a possibility of destroying the 
         //      best error in the window and still representing the now diverged solution.
         // the latent aspect of the gradient makes the solution still viable. it is "near" the 
@@ -544,23 +545,23 @@ impl <'a>NormNet <'a>{
         // checkpoint_window, as the name implies, can be modeled as a smoothing/clustering function.
 
         if self.checkpoint_window.len() >= checkpoint_window_size as usize {
-            // println!("evaluation window is full");
+            // log::debug!("evaluation window is full");
             // average checkpoint_window (dont need to divide since always comparing this value relatively) but we do so for more intuitive metrics relative to per column error
             let avg = self.checkpoint_window.iter().fold(0.0, |acc, x| acc + x)/ self.checkpoint_window.len() as f32;
             // print!("avg: {}", avg);
-            // println!(" vs lowest error: {}", self.lowest_error);
+            // log::debug!(" vs lowest error: {}", self.lowest_error);
 
             // this will probably get LICM'd anyways:
             let error_sum = error.iter().fold(0.0, |acc, x| acc + x)/error.len() as f32;
             self.checkpoint_window.push(error_sum);
 
-            // println!("error sum: {}", error_sum);
+            // log::debug!("error sum: {}", error_sum);
             if self.lowest_error > avg {
-                println!("NEW LOWEST ERROR: {}", avg);
+                log::debug!("NEW LOWEST ERROR: {}", avg);
                 self.lowest_error = avg;
-                println!("checkpointing..");
+                log::debug!("checkpointing..");
                 self.save()?;
-                println!("new best score: {:?}", self.lowest_error);
+                log::debug!("new best score: {:?}", self.lowest_error);
             }
             // process the checkpoint_window buffer
             self.checkpoint_window.clear();
@@ -569,7 +570,7 @@ impl <'a>NormNet <'a>{
             let error_sum = error.iter().fold(0.0, |acc, x| acc + x)/error.len() as f32;
             self.checkpoint_window.push(error_sum);
 
-            println!("error sum: {}", error_sum);
+            log::debug!("error sum: {}", error_sum);
         }
         // return Ok with Box dyn error
         Ok(())
@@ -580,7 +581,7 @@ impl <'a>NormNet <'a>{
     pub fn save(&mut self) -> Result<(), Box<dyn Error>> {
         // save the model to disk in the current directory
         if self.SavedModelSaver.borrow().is_none() {
-            println!("initializing saved model saver..");
+            log::debug!("initializing saved model saver..");
             let mut all_vars = self.net_vars.clone();
             all_vars.extend_from_slice(&self.minimize_vars);
             let mut builder = tensorflow::SavedModelBuilder::new();
@@ -648,13 +649,13 @@ impl <'a>NormNet <'a>{
         let cur_checkpoint_name = format!("{}/{}_{}", self.name, self.name, uuid);
 
         //update checkpoint_name
-        println!("saving model to {}", cur_checkpoint_name);
+        log::debug!("saving model to {}", cur_checkpoint_name);
         self.SavedModelSaver.borrow_mut().as_mut().unwrap().save(
             &self.session,
             &self.scope.graph(),
             cur_checkpoint_name.clone(),
         )?;
-        println!("serializing non-graph variables to {}", cur_checkpoint_name);
+        log::debug!("serializing non-graph variables to {}", cur_checkpoint_name);
         self.serialize_network(cur_checkpoint_name.clone())?;
         self.checkpoint_name = Some(cur_checkpoint_name);
 
@@ -664,7 +665,7 @@ impl <'a>NormNet <'a>{
     /// load the saved model in the directory dir and restore it in self, removing the 
     /// previous tensorflow graph and session.
     pub fn load(&mut self, dir: String) -> Result<(), Box<dyn Error>> {
-        println!("loading previously saved model..");
+        log::debug!("loading previously saved model..");
         let mut graph = Graph::new();
         //TODO: ensure we can access variables from graph or otherwise
         let bundle =
@@ -713,15 +714,15 @@ impl <'a>NormNet <'a>{
     ) -> Result<Vec<Tensor<f32>>, Box<dyn Error>> {
         //TODO: randomize input and labels while k-folding
         assert_eq!(inputs.len(), labels.len());
-        println!("trainning..");
+        log::debug!("trainning..");
         let mut result = vec![];
 
         let mut input_tensor: Tensor<T> = Tensor::new(&[1u64, inputs[0].len() as u64]);
         let mut label_tensor: Tensor<T> = Tensor::new(&[1u64, labels[0].len() as u64]);
 
-        println!("inputs.len(): {}", inputs.len());
-        println!("{}", inputs[0].len());
-        println!("{}", labels[0].len());
+        log::debug!("inputs.len(): {}", inputs.len());
+        log::debug!("{}", inputs[0].len());
+        log::debug!("{}", labels[0].len());
 
         let mut input_iter = inputs.into_iter();
         let mut label_iter = labels.into_iter();
@@ -772,7 +773,7 @@ impl <'a>NormNet <'a>{
             // update the moving average for time
             let average = avg_t.iter().sum::<f32>() / avg_t.len() as f32;
 
-            println!(
+            log::debug!(
                 "training on {}\n input: {:?} label: {:?} error: {} output: {} seconds/epoch: {:?}",
                 i, input, label, res, output,average 
             );
@@ -803,11 +804,11 @@ impl <'a>NormNet <'a>{
 
         //START OF TRAIN SUBROUTINE
         assert_eq!(inputs.len(), labels.len());
-        println!("trainning..");
+        log::debug!("trainning..");
 
-        println!("inputs.len(): {}", inputs.len());
-        println!("{}", inputs[0].len());
-        println!("{}", labels[0].len());
+        log::debug!("inputs.len(): {}", inputs.len());
+        log::debug!("{}", inputs[0].len());
+        log::debug!("{}", labels[0].len());
 
         let input_itl = inputs.clone();
         let label_itl = labels.clone();
@@ -863,7 +864,7 @@ impl <'a>NormNet <'a>{
             // update the moving average for time
             let average = avg_t.iter().sum::<f32>() / avg_t.len() as f32;
 
-            println!(
+            log::debug!(
                 "training on {}\n input: {:?} label: {:?} error: {} output: {} time/epoch(ms): {:?}",
                 i, input, label, res, output,average 
             );
@@ -874,12 +875,10 @@ impl <'a>NormNet <'a>{
         Ok(())
     }
 
-    //stochastically (with 'selection_pressure=n' for fitness) select checkpointed models 
-    //and save them if they are 'delta_fitness=x' above the previous lowest_error
-    ///stochastically select a model from dir with selection_pressure for the models fitness
+    ///randomly select a model from dir with selection_pressure for the models fitness
     pub fn load_checkpoint_search(&mut self, selection_pressure: f32) -> Result<(), Box<dyn Error>> {
         assert!(selection_pressure >= 0.0 && selection_pressure <= 1.0, "selection_pressure must be between 0 and 1");
-        println!("loading checkpointed models..");
+        log::debug!("loading checkpointed models..");
         let files_iter = fs::read_dir(self.name)?.par_bridge();
         // .par_bridge();
         // create an iterator from files_iter
@@ -943,14 +942,14 @@ impl <'a>NormNet <'a>{
             selection > serialized_network.lowest_error.clone()
         })
         // .inspect(|(dir, serialized_network)| {
-        //     println!("choosing from: {} {:?}", serialized_network.lowest_error, dir);
+        //     log::debug!("choosing from: {} {:?}", serialized_network.lowest_error, dir);
         // })
         .choose(&mut r).context("no checkpoint found")?;
 
         //TODO: search the tree for diversity either by looking at the expected future reward of a node (number of unique paths to unique frontier nodes) 
         //      or searching as horizontally as possible from the current checkpoint node with fitness pressure
 
-        println!("loading network with fitness: {:?}", serialized_network.lowest_error);
+        log::debug!("loading network with fitness: {:?}", serialized_network.lowest_error);
         self.load(dir)?;
         serialized_network.restore(self);
         // TODO: if Root node is selected, reinitialize all variables for random seed of network to ensure robust search
@@ -1023,7 +1022,7 @@ impl <'a>NormNet <'a>{
         Ok(outputs.clone())
     }
     //TODO: feedback network and rework name
-    //TODO: feedback network may need some inheritance or builder pattern constructor
+    //TODO: unrolling feedback network
     // pub fn feedback_sequence_evaluate()
 
 }
@@ -1033,12 +1032,12 @@ impl <'a>NormNet <'a>{
 mod tests {
     #[test]
     fn test_net() {
-        println!("test_net");
+        log::debug!("test_net");
         //call the main function
         use crate::*;
 
         //CONSTRUCTION//
-        let mut norm_net = NormNet::new("test_net",2, 1, 10, 10, 10, 1.0, 5 as f32).unwrap();
+        let mut norm_net = Brain::new("test_net",2, 1, 10, 10, 10, 1.0, 5 as f32).unwrap();
 
         //FITNESS FUNCTION//
         //TODO: auto gen labels from outputs and fitness function.
@@ -1063,12 +1062,12 @@ mod tests {
     #[test]
     fn test_serialization() {
         //TODO: failing after checkpoint features
-        println!("test_serialization");
+        log::debug!("test_serialization");
         //call the main function
         use crate::*;
 
         //CONSTRUCTION//
-        let mut norm_net = NormNet::new("test_serialization",2, 1, 20, 15, 10, 0.01, 5 as f32).unwrap();
+        let mut norm_net = Brain::new("test_serialization",2, 1, 20, 15, 10, 0.01, 5 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
         let mut inputs = Vec::new();
@@ -1102,10 +1101,10 @@ mod tests {
             } else {
                 path = is_dir.clone().to_str().unwrap().to_string();
             }
-            println!("{:?}", path);
+            log::debug!("{:?}", path);
         }
         let path = path.to_string();
-        println!("{:?}", path);
+        log::debug!("{:?}", path);
 
         norm_net.load(path.to_string()).unwrap();
 
@@ -1114,10 +1113,10 @@ mod tests {
 
     #[test]
     fn test_checkpoint(){
-        println!("test_checkpoint");
+        log::debug!("test_checkpoint");
         use crate::*;
         //CONSTRUCTION//
-        let mut norm_net = NormNet::new("test_checkpoint",2, 1, 200, 96, 10, 10.0, 5 as f32).unwrap();
+        let mut norm_net = Brain::new("test_checkpoint",2, 1, 200, 96, 10, 10.0, 5 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
         // create entries for inputs and outputs of xor
@@ -1144,10 +1143,10 @@ mod tests {
     }
     #[test]
     fn test_infer(){
-        println!("test_inference");
+        log::debug!("test_inference");
         use crate::*;
         //CONSTRUCTION//
-        let mut norm_net = NormNet::new("test_inference",2, 1, 200, 96, 10, 10.0, 5 as f32).unwrap();
+        let mut norm_net = Brain::new("test_inference",2, 1, 200, 96, 10, 10.0, 5 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
         // create entries for inputs and outputs of xor
@@ -1158,10 +1157,10 @@ mod tests {
     }
     #[test]
     fn test_evaluate(){
-        println!("test_evaluate");
+        log::debug!("test_evaluate");
         use crate::*;
         //CONSTRUCTION//
-        let mut norm_net = NormNet::new("test_evaluate",2, 1, 200, 96, 10, 1.0, 10 as f32).unwrap();
+        let mut norm_net = Brain::new("test_evaluate",2, 1, 200, 96, 10, 1.0, 10 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
 
