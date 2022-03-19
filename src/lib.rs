@@ -1,11 +1,3 @@
-//  Brain: a Deep Artificial Neural Network using normalizing neurons to investigate alternatives to bias
-//  based expressivity. Gradient based connection-wise dropout is also included due to the numeric properties
-//  inherent to normalization (thanks to a little trig and calculus). This allows Brain to also be a sparse-searching
-//  "top down" architecture search where the parameters are recoverable thanks again to the gradient.
-//  It is hypothesized and investigated here that the aforementioned features will lead to much more robust transfer
-//  learning and therein generalization. The only significant downsides to this is a division by constant operation on each node
-//  (seemingly/empirically not as bad as it sounds).
-
 //TODO: allow this to fallback to TF-CPU for machines without GPU and possibly just do inference with a build script.
 //TODO: floats stink norm net is an attempt to realizing rot net and uint8 operations with bounded functions while retaining all the flaws in DNNs.. (go back to rot net at some point)
 //TODO: rayon all the things
@@ -19,6 +11,8 @@
 
 //allow unstable features
 // #![feature(int_log)]
+mod layers;
+
 use log;
 use serde::{Serialize, Deserialize};
 use serde_derive::{Serialize, Deserialize};
@@ -72,194 +66,9 @@ use tensorflow::REGRESS_INPUTS;
 use tensorflow::REGRESS_METHOD_NAME;
 use tensorflow::REGRESS_OUTPUTS;
 use uuid::Uuid;
+use layers::*;
 
-/// A standard fully connected layer with bias term
-///
-/// `activation` is a function which takes a tensor and applies an activation
-/// function such as sigmoid.
-///
-/// Returns variables created and the layer output.
-fn layer<O1: Into<Output>>(
-    input: O1,
-    input_size: u64,
-    output_size: u64,
-    activation: &dyn Fn(Output, &mut Scope) -> Result<Output, Status>,
-    scope: &mut Scope,
-) -> Result<(Vec<Variable>, Output), Status> {
-    let mut scope = scope.new_sub_scope("layer");
-    let scope = &mut scope;
-    let w_shape = ops::constant(&[input_size as i64, output_size as i64][..], scope)?;
-    let w = Variable::builder()
-        .initial_value(
-            ops::RandomStandardNormal::new()
-                .dtype(DataType::Half)
-                .build(w_shape, scope)?,
-        )
-        .data_type(DataType::Half)
-        .shape([input_size, output_size])
-        .build(&mut scope.with_op_name("w"))?;
-    let b = Variable::builder()
-        .const_initial_value(Tensor::<f16>::new(&[output_size]))
-        .build(&mut scope.with_op_name("b"))?;
-    //n is input_size to be divided at each node in order to normalize the signals at each node before activation
-    Ok((
-        vec![w.clone(), b.clone()],
-        activation(
-            ops::add(
-                ops::mat_mul(input, w.output().clone(), scope)?,
-                b.output().clone(),
-                scope,
-            )?
-            .into(),
-            scope,
-        )?,
-    ))
-}
-
-pub fn norm_layer<O1: Into<Output>>(
-    input: O1,
-    input_size: u64,
-    output_size: u64,
-    activation: &dyn Fn(Output, &mut Scope) -> Result<Operation, Status>,
-    scope: &mut Scope,
-) -> Result<(Vec<Variable>, Output, Operation), Status> {
-    let mut scope = scope.new_sub_scope("layer");
-    let scope = &mut scope;
-    let w_shape = ops::constant(&[input_size as i64, output_size as i64][..], scope)?;
-    let w = Variable::builder()
-        .initial_value(
-            ops::RandomStandardNormal::new()
-                .dtype(DataType::Float)
-                .build(w_shape.clone(), scope)?,
-        )
-        .data_type(DataType::Float)
-        .shape([input_size, output_size])
-        .build(&mut scope.with_op_name("w"))?;
-
-    let n = ops::constant(input_size as f32, scope)?;
-
-    //NOTE: tan on weights is to force weights to dropout but use the gradient for better dropout than random node based dropout
-    //NOTE: we multiply the activation by 100 to represent values </>than 1/-1
-    let output_op = ops::div(
-        ops::mat_mul(
-            input,
-            //this sets the gradients to dropout weights
-            ops::tan(w.output().clone(), scope)?,
-            scope,
-        )?,
-        n,
-        scope,
-    )?;
-
-    let act = activation(
-        //this normalizes to speed up trainning and sample efficiency
-        output_op.into(),
-        scope,
-    )?;
-    let output_op = act.clone();
-    // .into(); //,
-    Ok((vec![w.clone()], act.into(), output_op))
-}
-
-///a normal layer as above but with residual connections
-fn norm_layer_res<O1: Into<Output>>(
-    input: O1,
-    res_input: O1,
-    input_size: u64,
-    output_size: u64,
-    activation: &dyn Fn(Output, &mut Scope) -> Result<Output, Status>,
-    scope: &mut Scope,
-) -> Result<(Vec<Variable>, Output), Status> {
-    let mut scope = scope.new_sub_scope("layer");
-    let scope = &mut scope;
-    let w_shape = ops::constant(&[input_size as i64, output_size as i64][..], scope)?;
-    let w = Variable::builder()
-        .initial_value(
-            ops::RandomStandardNormal::new()
-                .dtype(DataType::Half)
-                .build(w_shape.clone(), scope)?,
-        )
-        .data_type(DataType::Half)
-        .shape([input_size, output_size])
-        .build(&mut scope.with_op_name("w"))?;
-
-    //n is input_size to be divided at each node in order to normalize the signals at each node before activation
-    let input_size = 2 * input_size;
-    //TODO: concat the input and res tensors
-    // let concat = ops::concat(0,vec![input, res_input],  scope)?.into();
-
-    let scalar_coe = ops::constant(f16::from_f32(0.1), scope)?;
-    let cur = ops::mat_mul(
-        input,
-        //NOTE: division for half stability the higher this value the more stable the trainning but the less expressivity (domain) of the weights
-        //NOTE: tan on weights is to force weights to dropout but use the gradient for better dropout than random node based dropout
-        ops::multiply(
-            ops::tan(w.output().clone(), scope)?,
-            scalar_coe.clone(),
-            scope,
-        )?,
-        scope,
-    )?;
-
-    // let cur_res = ops::mat_mul(
-    // res_input,
-    // ops::multiply(ops::tan(w_res.output().clone(), scope)?, scalar_coe.clone(), scope)?,
-    // scope,
-    // )?;
-    // ops::tan(w_res.output().clone(), scope)?, scope)?;
-    let res_input = ops::multiply(scalar_coe, res_input, scope)?;
-    let cur = ops::add(cur, res_input, scope)?;
-
-    let n = ops::constant(f16::from_f32(input_size as f32), scope)?;
-
-    let res = activation(ops::div(cur, n, scope)?.into(), scope)?.into(); //,
-
-    // Ok((vec![w.clone(), w_res.clone()], res))
-    Ok((vec![w.clone()], res))
-}
 //TODO: defaults such as learning rate
-//================
-//----NORM_NET----
-//================
-/// A standard fully connected layer without bias trainnable parameters
-/// instead normalizing and dropping out connections at each node.
-///
-/// NOTE: currently inputs and outputs must be flattened if representing >1 dim data
-///
-/// #
-/// PROS:
-///
-/// * better exploration by removing instabilities inherent to bias
-///        
-/// * gradient based connection-wise dropout with tan weights
-///       
-/// * better transfer learning by removing bias connections
-///       
-/// * ~shouldn't~ have exploding gradient although vanishing gradient may be possible due to normalizing division.
-///      
-/// * technically connection wise dropout is divisive (top down) architecture search (e.g.: the opposite of NEAT (bottom up) which is agglomerative)
-///
-/// CONS:
-/// * may be slower due to more operations (division)
-///       
-/// * input and output must/should be tailored for normalized input/output (standard data science practices)
-///       
-/// * needs large type precision for stability, but the stability can be tuned (as apposed to bias which needs architectural considerations)
-///
-/// #
-/// NOTE: parameters goes to zero whereas biases find some 1-dimensional partition from -inf to inf. This helps
-/// build subgraph search modules (subtrees essentially). That can quickly optimize for distinct domains and labels via dropout.
-///
-/// NOTE:
-/// Tanh should the first and last layers activation function to map inputs and outputs to negative values.
-/// multiplying the output by some multiple of 10 allows the otherwise normalized network to take in and output whole integers.
-/// -x > y > x | x > 1
-///
-/// NOTE:
-/// We dont use BFloat since the integer range is only used as a buffer for addition overflow in matmul.
-/// In all other operations we are strictly bounded -1 > x > 1. As long as layer_width is not
-/// greater than Float range we are fine in the worst case (summing all 1's).
-/// Otherwise decimal precision of float type is our parameter type precision.
 pub struct Brain<'a> {
     //TODO: refactor with builder pattern for RL, checkpointing and feedback network once tested and working.
     /// Tensorflow objects for user abstraction from Tensorflow
@@ -302,44 +111,26 @@ pub struct Brain<'a> {
     ///the current name of the checkpoint being searched
     checkpoint_name: Option<String>,
 }
-///The serialized representation of the model outside of tensorflow graph.
-///Primarily used for checkpoint search meta-learner.
-#[derive(Serialize, Deserialize,Debug)]
-struct SerializedNetwork{
-    /// The previous checkpoint that created this checkpoint for informed graph 
-    /// selection checkpoint search.
-    parent_search_name: String,
-    checkpoint_name: Option<String>,
-    lowest_error: f32,
-} 
-impl SerializedNetwork{
-    /// Constructs a new serialized network from a checkpoint name and the lowest error
-    fn new(parent_search_name: String, checkpoint_name: Option<String>, lowest_error: f32) -> Self{
-        Self{
-            parent_search_name,
-            checkpoint_name,
-            lowest_error,
-        }
-    }
-    fn restore(self, norm_net: &mut Brain) {
-        // let mut Brain = Brain.clone();
-        norm_net.checkpoint_name = self.checkpoint_name;
-        norm_net.lowest_error = self.lowest_error;
-        // Brain
-    }
-}
 impl <'a>Brain <'a>{
     //TODO: type safety: some of the meta-learning values should be 64 bit for overflow since we sum 32s etc.
-    pub fn new(
+    pub fn new<Architecture>(
         name: &'a str,
         input_size: u64,
         output_size: u64,
+        //Number of neurons in each layer
         layer_width: u64,
+        //Number of layers in the network
         layer_height: u64,
+        //TODO: move this into layer
+        layer: Architecture,
         max_integer: u32,
         learning_rate: f32,
         error_power: f32,
-    ) -> Result<Brain<'a>, Status> {
+    ) -> Result<Brain<'a>, Status> 
+    where
+        Architecture: 
+            Fn(Output, u64, u64, &dyn Fn(Output, &mut Scope) -> Result<Operation, Status>,&mut Scope) -> 
+            Result<(Vec<Variable>,Output, Operation), Status>{
         assert!(max_integer % 10 == 0 || max_integer == 1, "max_integer must be a multiple of 10 or 1 since it represents order of magnitude of the integer range");
         let mut scope = Scope::new_root_scope();
 
@@ -354,7 +145,7 @@ impl <'a>Brain <'a>{
             .build(&mut scope.with_op_name("label"))?;
 
         //CONSTRUCT NETWORK
-        //TODO: EXTRACT THIS TO LAYERS.RS. THIS IS ALL THATS NEEDED TO MAKE THIS AN ARCHITECTURE DESIGN CRATE.
+        //TODO: extract this to a builder pattern for constructor readability.
         let mut net_vars = vec![];
         let mut net_layers = vec![];
 
@@ -402,6 +193,7 @@ impl <'a>Brain <'a>{
             },
             &mut scope,
         )?;
+        //NOTE: need net_vars and net_layers as return values
         net_vars.extend(vars);
         net_layers.push(output.clone());
         //END OF CONSTRUCTING NETWORK
@@ -1024,7 +816,33 @@ impl <'a>Brain <'a>{
     //TODO: feedback network and rework name
     //TODO: unrolling feedback network
     // pub fn feedback_sequence_evaluate()
+}
 
+///The serialized representation of the model outside of tensorflow graph.
+///Primarily used for checkpoint search meta-learner.
+#[derive(Serialize, Deserialize,Debug)]
+struct SerializedNetwork{
+    /// The previous checkpoint that created this checkpoint for informed graph 
+    /// selection checkpoint search.
+    parent_search_name: String,
+    checkpoint_name: Option<String>,
+    lowest_error: f32,
+} 
+impl SerializedNetwork{
+    /// Constructs a new serialized network from a checkpoint name and the lowest error
+    fn new(parent_search_name: String, checkpoint_name: Option<String>, lowest_error: f32) -> Self{
+        Self{
+            parent_search_name,
+            checkpoint_name,
+            lowest_error,
+        }
+    }
+    fn restore(self, norm_net: &mut Brain) {
+        // let mut Brain = Brain.clone();
+        norm_net.checkpoint_name = self.checkpoint_name;
+        norm_net.lowest_error = self.lowest_error;
+        // Brain
+    }
 }
 
 //TODO: add assertions for more than just runtime error.
@@ -1037,7 +855,7 @@ mod tests {
         use crate::*;
 
         //CONSTRUCTION//
-        let mut norm_net = Brain::new("test_net",2, 1, 10, 10, 10, 1.0, 5 as f32).unwrap();
+        let mut norm_net = Brain::new("test_net",2, 1, 10, 10, norm_layer, 10, 1.0, 5 as f32).unwrap();
 
         //FITNESS FUNCTION//
         //TODO: auto gen labels from outputs and fitness function.
@@ -1067,7 +885,7 @@ mod tests {
         use crate::*;
 
         //CONSTRUCTION//
-        let mut norm_net = Brain::new("test_serialization",2, 1, 20, 15, 10, 0.01, 5 as f32).unwrap();
+        let mut norm_net = Brain::new("test_serialization",2, 1, 20, 15, norm_layer, 10, 0.01, 5 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
         let mut inputs = Vec::new();
@@ -1116,7 +934,7 @@ mod tests {
         log::debug!("test_checkpoint");
         use crate::*;
         //CONSTRUCTION//
-        let mut norm_net = Brain::new("test_checkpoint",2, 1, 200, 96, 10, 10.0, 5 as f32).unwrap();
+        let mut norm_net = Brain::new("test_checkpoint",2, 1, 200, 96, norm_layer, 10, 10.0, 5 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
         // create entries for inputs and outputs of xor
@@ -1146,7 +964,7 @@ mod tests {
         log::debug!("test_inference");
         use crate::*;
         //CONSTRUCTION//
-        let mut norm_net = Brain::new("test_inference",2, 1, 200, 96, 10, 10.0, 5 as f32).unwrap();
+        let mut norm_net = Brain::new("test_inference",2, 1, 200, 96, norm_layer, 10, 10.0, 5 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
         // create entries for inputs and outputs of xor
@@ -1160,7 +978,7 @@ mod tests {
         log::debug!("test_evaluate");
         use crate::*;
         //CONSTRUCTION//
-        let mut norm_net = Brain::new("test_evaluate",2, 1, 200, 96, 10, 1.0, 10 as f32).unwrap();
+        let mut norm_net = Brain::new("test_evaluate",2, 1, 200, 96, norm_layer, 10, 1.0, 10 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
 
@@ -1187,4 +1005,7 @@ mod tests {
             let res: Tensor<f32> =  norm_net.evaluate(inputs, 1, fitness_function.clone()).unwrap();
         }
     }
+    //TODO: test layer modularity
+    // #[test]
+    // fn test_architectures(){}
 }
