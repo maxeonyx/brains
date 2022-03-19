@@ -1,6 +1,6 @@
 [package]
 name = "Brains"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Corallus-Caninus <ward.joshua92@yahoo.com>"]
 edition = "2021"
 description = "Rust based Artificial Neural Network framework with TensorFlow"
