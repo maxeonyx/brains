@@ -12,6 +12,7 @@
 //allow unstable features
 // #![feature(int_log)]
 mod layers;
+mod activations;
 
 use log;
 use serde::{Serialize, Deserialize};
@@ -67,6 +68,7 @@ use tensorflow::REGRESS_METHOD_NAME;
 use tensorflow::REGRESS_OUTPUTS;
 use uuid::Uuid;
 use layers::*;
+use activations::*;
 
 //TODO: defaults such as learning rate
 pub struct Brain<'a> {
@@ -150,8 +152,9 @@ impl <'a>Brain <'a>{
 
         //initial layer
         let (vars, cur_layer, _) = 
-        //TODO: also make activation functions an enum mod 
-        layer(Input.clone().into(), input_size, layer_width, &|x, scope| Ok(ops::tanh(x,scope)?.into()), &mut scope)?;
+        layer(Input.clone().into(), input_size, layer_width, 
+        //TODO: remove this pointer
+        &activations::tanh(max_integer), &mut scope)?;
 
         net_vars.extend(vars);
         net_layers.push(cur_layer.clone());
@@ -159,29 +162,22 @@ impl <'a>Brain <'a>{
         let mut prev_layer = cur_layer;
         //hidden layers
         for i in 0..layer_height - 2 {
-            let (vars, cur_layer, _) = layer(prev_layer.clone().into(), layer_width, layer_width, &|x, scope| Ok(ops::tanh(x,scope)?.into()),&mut scope)?;
+            let (vars, cur_layer, _) = layer(prev_layer.clone().into(), layer_width, layer_width, 
+            &activations::tanh(max_integer), &mut scope)?;
             prev_layer = cur_layer.clone();
 
             net_vars.extend(vars);
             net_layers.push(cur_layer.clone());
         }
 
+        //the final output layer is always tanh to express negative values and multiplied to stabilize the
+        //half precision gradient as well as express whole integers outside of -1 and 1.
         let (vars, output, Output_op) = 
         layer(
             net_layers.last().unwrap().clone(),
             layer_width,
             output_size,
-            &|x, scope| {
-                //TODO: extract to activation mod
-                //the final output layer is tanh to express negative values and multiplied to stabilize the
-                //half precision gradient as well as express whole integers outside of -1 and 1.
-                Ok(ops::multiply(
-                    ops::tanh(x, scope)?,
-                    ops::constant(max_integer as f32, scope)?,
-                    scope,
-                )?
-                .into())
-            },
+            &activations::tanh(max_integer),
             &mut scope,
         )?;
         //NOTE: need net_vars and net_layers as return values
@@ -983,7 +979,7 @@ mod tests {
             res_tensor
         });
         // create entries for inputs and outputs of xor
-        for _ in 0..10{
+        for _ in 0..30{
             // same as above but push a vec with two random floats
             let inputs = vec![(rrng.gen::<f32>()), (rrng.gen::<f32>())];
             let res: Tensor<f32> =  norm_net.evaluate(inputs, 1, fitness_function.clone()).unwrap();
