@@ -1,3 +1,8 @@
+//a layer defines how each layer in the network communicates with the next layer.
+//
+//this includes but is not limited to: convolution, residual connections (how the network layers are connected),
+//bias operations, recurrent connections, variant and invariant scaling, etc. if it isnt an activation operation 
+//it should be defined here.
 //TODO: layers that can be passed in to Network in a separate crate to allow architecture engineering
 use half::f16;
 use tensorflow::ops;
@@ -28,7 +33,13 @@ use tensorflow::REGRESS_INPUTS;
 use tensorflow::REGRESS_METHOD_NAME;
 use tensorflow::REGRESS_OUTPUTS;
 
-//TODO: need a partial for generic type so these can be passed functionally:
+use crate::activations::Activation;
+
+//NOTE: we use a virtual function table but theres no reason this wont get inlined with LLVM arg-promotion
+//      as long as the configuration passed to each layer function is static.
+pub type Layer= Box<dyn Fn(Output, u64, u64, &dyn Fn(Output, &mut Scope) -> Result<Operation, Status>,&mut Scope) -> 
+    Result<(Vec<Variable>,Output, Operation), Status>>;
+//TODO: need a builder for unique configuration:
 
 /// A standard fully connected layer with bias term
 ///
@@ -36,13 +47,14 @@ use tensorflow::REGRESS_OUTPUTS;
 /// function such as sigmoid.
 ///
 /// Returns variables created and the layer output.
-fn layer<O1: Into<Output>>(
+fn fully_connected_layer<O1: Into<Output>>(
     input: O1,
     input_size: u64,
     output_size: u64,
-    activation: &dyn Fn(Output, &mut Scope) -> Result<Output, Status>,
+    // activation: &dyn Fn(Output, &mut Scope) -> Result<Output, Status>,
+    activation: Activation,
     scope: &mut Scope,
-) -> Result<(Vec<Variable>, Output), Status> {
+) -> Result<(Vec<Variable>, Operation), Status> {
     let mut scope = scope.new_sub_scope("layer");
     let scope = &mut scope;
     let w_shape = ops::constant(&[input_size as i64, output_size as i64][..], scope)?;

@@ -68,7 +68,9 @@ use tensorflow::REGRESS_METHOD_NAME;
 use tensorflow::REGRESS_OUTPUTS;
 use uuid::Uuid;
 use layers::*;
+use layers::Layer;
 use activations::*;
+use activations::Activation;
 
 //TODO: defaults such as learning rate
 pub struct Brain<'a> {
@@ -115,7 +117,7 @@ pub struct Brain<'a> {
 }
 impl <'a>Brain <'a>{
     //TODO: type safety: some of the meta-learning values should be 64 bit for overflow since we sum 32s etc.
-    pub fn new<Architecture>(
+    pub fn new(
         name: &'a str,
         input_size: u64,
         output_size: u64,
@@ -123,16 +125,11 @@ impl <'a>Brain <'a>{
         layer_width: u64,
         //Number of layers in the network
         layer_height: u64,
-        layer: Architecture,
-        activation: Box<dyn Fn(Output, &mut Scope) -> Result<Operation, Status>>, 
+        layer: Layer,
+        activation: Activation,
         learning_rate: f32,
         error_power: f32,
-    ) -> Result<Brain<'a>, Status> 
-    where
-        //TODO: this is layer, rename when implementing architecture
-        Architecture: 
-            Fn(Output, u64, u64, &dyn Fn(Output, &mut Scope) -> Result<Operation, Status>,&mut Scope) -> 
-            Result<(Vec<Variable>,Output, Operation), Status>{
+    ) -> Result<Brain<'a>, Status> {
         let mut scope = Scope::new_root_scope();
 
         // TODO: consider inlining this since were encapsulating
@@ -842,7 +839,7 @@ mod tests {
         use crate::*;
 
         //CONSTRUCTION//
-        let mut norm_net = Brain::new("test_net",2, 1, 10, 10, norm_layer, activations::tanh(10), 1.0, 5 as f32).unwrap();
+        let mut norm_net = Brain::new("test_net",2, 1, 10, 10, Box::new(norm_layer), activations::tanh(10), 1.0, 5 as f32).unwrap();
 
         //FITNESS FUNCTION//
         //TODO: auto gen labels from outputs and fitness function.
@@ -872,7 +869,7 @@ mod tests {
         use crate::*;
 
         //CONSTRUCTION//
-        let mut norm_net = Brain::new("test_serialization",2, 1, 20, 15, norm_layer, activations::tanh(10), 0.01, 5 as f32).unwrap();
+        let mut norm_net = Brain::new("test_serialization",2, 1, 20, 15, Box::new(norm_layer), activations::tanh(10), 0.01, 5 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
         let mut inputs = Vec::new();
@@ -921,7 +918,7 @@ mod tests {
         log::debug!("test_checkpoint");
         use crate::*;
         //CONSTRUCTION//
-        let mut norm_net = Brain::new("test_checkpoint",2, 1, 200, 96, norm_layer, activations::tanh(10), 10.0, 5 as f32).unwrap();
+        let mut norm_net = Brain::new("test_checkpoint",2, 1, 200, 96, Box::new(norm_layer), activations::tanh(10), 10.0, 5 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
         // create entries for inputs and outputs of xor
@@ -951,7 +948,7 @@ mod tests {
         log::debug!("test_inference");
         use crate::*;
         //CONSTRUCTION//
-        let mut norm_net = Brain::new("test_inference",2, 1, 200, 96, norm_layer, activations::tanh(10), 10.0, 5 as f32).unwrap();
+        let mut norm_net = Brain::new("test_inference",2, 1, 200, 96, Box::new(norm_layer), activations::tanh(10), 10.0, 5 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
         // create entries for inputs and outputs of xor
@@ -965,7 +962,7 @@ mod tests {
         log::debug!("test_evaluate");
         use crate::*;
         //CONSTRUCTION//
-        let mut norm_net = Brain::new("test_evaluate",2, 1, 200, 96, norm_layer, activations::tanh(10), 1.0, 10 as f32).unwrap();
+        let mut norm_net = Brain::new("test_evaluate",2, 1, 200, 96, Box::new(norm_layer), activations::tanh(10), 1.0, 10 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
 
