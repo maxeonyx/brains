@@ -37,9 +37,9 @@ use crate::activations::Activation;
 
 //NOTE: we use a virtual function table but theres no reason this wont get inlined with LLVM arg-promotion
 //      as long as the configuration passed to each layer function is static.
+//NOTE: activations are unboxed here for borrow checker reasons
 pub type Layer= Box<dyn Fn(Output, u64, u64, &dyn Fn(Output, &mut Scope) -> Result<Operation, Status>,&mut Scope) -> 
     Result<(Vec<Variable>,Output, Operation), Status>>;
-//TODO: need a builder for unique configuration:
 
 /// A standard fully connected layer with bias term
 ///
@@ -51,10 +51,9 @@ fn fully_connected_layer<O1: Into<Output>>(
     input: O1,
     input_size: u64,
     output_size: u64,
-    // activation: &dyn Fn(Output, &mut Scope) -> Result<Output, Status>,
-    activation: Activation,
+    activation: &dyn Fn(Output, &mut Scope) -> Result<Operation, Status>,
     scope: &mut Scope,
-) -> Result<(Vec<Variable>, Operation), Status> {
+) -> Result<(Vec<Variable>, Output, Operation), Status> {
     let mut scope = scope.new_sub_scope("layer");
     let scope = &mut scope;
     let w_shape = ops::constant(&[input_size as i64, output_size as i64][..], scope)?;
@@ -71,18 +70,28 @@ fn fully_connected_layer<O1: Into<Output>>(
         .const_initial_value(Tensor::<f16>::new(&[output_size]))
         .build(&mut scope.with_op_name("b"))?;
     //n is input_size to be divided at each node in order to normalize the signals at each node before activation
+    let act = activation(
+        ops::add(
+            ops::mat_mul(input, w.output().clone(), scope)?,
+            b.output().clone(),
+            scope,
+        )?
+        .into(),
+        scope,
+    )?;
+    let output_op = act.clone();
     Ok((
         vec![w.clone(), b.clone()],
-        activation(
-            ops::add(
-                ops::mat_mul(input, w.output().clone(), scope)?,
-                b.output().clone(),
-                scope,
-            )?
-            .into(),
-            scope,
-        )?,
+        act.into(),
+        output_op,
     ))
+}
+/// Builder for fully_connected_layer
+/// Passes in layer configuration and returns a pointer to a Layer type.
+pub fn fully_connected() -> Layer{
+    Box::new(
+      fully_connected_layer
+    )
 }
 
 //================
@@ -127,7 +136,7 @@ fn fully_connected_layer<O1: Into<Output>>(
 /// In all other operations we are strictly bounded -1 > x > 1. As long as layer_width is not
 /// greater than Float range we are fine in the worst case (summing all 1's).
 /// Otherwise decimal precision of float type is our parameter type precision.
-pub fn norm_layer<O1: Into<Output>>(
+fn norm_layer<O1: Into<Output>>(
     input: O1,
     input_size: u64,
     output_size: u64,
@@ -167,13 +176,21 @@ pub fn norm_layer<O1: Into<Output>>(
         output_op.into(),
         scope,
     )?;
+    //the activatied output signal
     let output_op = act.clone();
     // .into(); //,
     Ok((vec![w.clone()], act.into(), output_op))
 }
+/// Builder function for norm_layer. 
+/// Passes in layer configuration and returns a pointer to a Layer type.
+pub fn norm() -> Layer {
+    Box::new(
+        norm_layer
+    )
+}
 
 ///a normal layer as above but with residual connections
-fn norm_layer_res<O1: Into<Output>>(
+fn norm_res_layer<O1: Into<Output>>(
     input: O1,
     //TODO: trait macro for extra args or a builder with trait class?
     res_input: O1,
