@@ -124,15 +124,15 @@ impl <'a>Brain <'a>{
         //Number of layers in the network
         layer_height: u64,
         layer: Architecture,
-        max_integer: u32,
+        activation: Box<dyn Fn(Output, &mut Scope) -> Result<Operation, Status>>, 
         learning_rate: f32,
         error_power: f32,
     ) -> Result<Brain<'a>, Status> 
     where
+        //TODO: this is layer, rename when implementing architecture
         Architecture: 
             Fn(Output, u64, u64, &dyn Fn(Output, &mut Scope) -> Result<Operation, Status>,&mut Scope) -> 
             Result<(Vec<Variable>,Output, Operation), Status>{
-        assert!(max_integer % 10 == 0 || max_integer == 1, "max_integer must be a multiple of 10 or 1 since it represents order of magnitude of the integer range");
         let mut scope = Scope::new_root_scope();
 
         // TODO: consider inlining this since were encapsulating
@@ -154,7 +154,7 @@ impl <'a>Brain <'a>{
         let (vars, cur_layer, _) = 
         layer(Input.clone().into(), input_size, layer_width, 
         //TODO: remove this pointer
-        &activations::tanh(max_integer), &mut scope)?;
+        &activation, &mut scope)?;
 
         net_vars.extend(vars);
         net_layers.push(cur_layer.clone());
@@ -163,7 +163,7 @@ impl <'a>Brain <'a>{
         //hidden layers
         for i in 0..layer_height - 2 {
             let (vars, cur_layer, _) = layer(prev_layer.clone().into(), layer_width, layer_width, 
-            &activations::tanh(max_integer), &mut scope)?;
+            &activation, &mut scope)?;
             prev_layer = cur_layer.clone();
 
             net_vars.extend(vars);
@@ -177,7 +177,7 @@ impl <'a>Brain <'a>{
             net_layers.last().unwrap().clone(),
             layer_width,
             output_size,
-            &activations::tanh(max_integer),
+            &activation,
             &mut scope,
         )?;
         //NOTE: need net_vars and net_layers as return values
@@ -842,7 +842,7 @@ mod tests {
         use crate::*;
 
         //CONSTRUCTION//
-        let mut norm_net = Brain::new("test_net",2, 1, 10, 10, norm_layer, 10, 1.0, 5 as f32).unwrap();
+        let mut norm_net = Brain::new("test_net",2, 1, 10, 10, norm_layer, activations::tanh(10), 1.0, 5 as f32).unwrap();
 
         //FITNESS FUNCTION//
         //TODO: auto gen labels from outputs and fitness function.
@@ -872,7 +872,7 @@ mod tests {
         use crate::*;
 
         //CONSTRUCTION//
-        let mut norm_net = Brain::new("test_serialization",2, 1, 20, 15, norm_layer, 10, 0.01, 5 as f32).unwrap();
+        let mut norm_net = Brain::new("test_serialization",2, 1, 20, 15, norm_layer, activations::tanh(10), 0.01, 5 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
         let mut inputs = Vec::new();
@@ -921,11 +921,11 @@ mod tests {
         log::debug!("test_checkpoint");
         use crate::*;
         //CONSTRUCTION//
-        let mut norm_net = Brain::new("test_checkpoint",2, 1, 200, 96, norm_layer, 10, 10.0, 5 as f32).unwrap();
+        let mut norm_net = Brain::new("test_checkpoint",2, 1, 200, 96, norm_layer, activations::tanh(10), 10.0, 5 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
         // create entries for inputs and outputs of xor
-        //TODO: window size and training_iterations is hyperparameter for arch search. they should exist in shared struct or function parameter 
+        //TODO: window size and trag_iterations is hyperparameter for arch search. they should exist in shared struct or function parameter 
         //TODO: how can we train this in RL? need to store window and selection_pressure in class state
         //TODO: this needs to happen on initialization
         for _ in 0..15{
@@ -951,7 +951,7 @@ mod tests {
         log::debug!("test_inference");
         use crate::*;
         //CONSTRUCTION//
-        let mut norm_net = Brain::new("test_inference",2, 1, 200, 96, norm_layer, 10, 10.0, 5 as f32).unwrap();
+        let mut norm_net = Brain::new("test_inference",2, 1, 200, 96, norm_layer, activations::tanh(10), 10.0, 5 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
         // create entries for inputs and outputs of xor
@@ -965,7 +965,7 @@ mod tests {
         log::debug!("test_evaluate");
         use crate::*;
         //CONSTRUCTION//
-        let mut norm_net = Brain::new("test_evaluate",2, 1, 200, 96, norm_layer, 10, 1.0, 10 as f32).unwrap();
+        let mut norm_net = Brain::new("test_evaluate",2, 1, 200, 96, norm_layer, activations::tanh(10), 1.0, 10 as f32).unwrap();
         //TRAIN//
         let mut rrng = rand::thread_rng();
 
