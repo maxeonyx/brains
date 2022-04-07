@@ -1,6 +1,6 @@
 [package]
 name = "Brains"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Corallus-Caninus <ward.joshua92@yahoo.com>"]
 edition = "2021"
 description = "Rust based Artificial Neural Network framework with TensorFlow"
@@ -26,3 +26,4 @@ serde_json = "1.0.79"
 anyhow = "1.0.53"
 rayon = "1.5.1"
 log = "0.4.14"
+simple-logging = "2.0.2"
