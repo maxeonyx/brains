@@ -1,5 +1,3 @@
-NOTE: I am testing V lang as a potential platform for Brains. If codegen for TF goes well expect this project to move to V
-
 # Brains
 NOTE: this project is very early and was spawned from my own architecture research. contributions, opinions and issues are very welcome! Version 1.X.X will be considered ready for public use.
 
