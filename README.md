@@ -1,11 +1,19 @@
-# Brains
-NOTE: this project is very early and was spawned from my own architecture research. contributions, opinions and issues are very welcome! Version 1.X.X will be considered ready for public use.
+# 🧠 _brains_ 🧠
 
-an Artificial Neural Network framework built on Tensorflow-rs bindings for creating architectures similar to keras but also with direct integration for custom layers in low level Tensorflow. Includes native checkpointing, inference, batch trainning and iterative trainning. See the unittests to get an idea of how things are called until documentation is created. Also ensure to enable the GPU flag for tensorflow if you want to offload computation.
+I've forked this project from @Corallus-Caninus to build on top of. My goals for it are:
+
+1. Create a small, opinionated training framework for Tensorflow/Rust.
+2. Create implementations of some networks that I want to use for NN interpretability experiments.
+3. Potentially use this library as the base for tensor operations in my language [Kal](https://github.com/maxeonyx/kal)
+
+
+## What it is currently
+
+An Artificial Neural Network framework built on Tensorflow-rs bindings for creating architectures similar to keras but also with direct integration for custom layers in low level Tensorflow. Includes native checkpointing, inference, batch trainning and iterative trainning. See the unittests to get an idea of how things are called until documentation is created. Also ensure to enable the GPU flag for tensorflow if you want to offload computation.
 
 Currently all inputs and outputs are represented as flattend 1D rust Vecs.
 
-# TODO: 
+## TODO: 
 
 add more generic typing, currently f32 for parameters and u64 for architecture size is standard.
 
@@ -15,7 +23,7 @@ add a form of N dimensional convolution that maps to the 1D input vectors and hi
 
 formalize documentation for layers (unscaled architectures) as seen below.
 
-# Architectures
+## Architectures
 ## NormNet
 Research in Neural Networks without bias and gradient based connection dropout by utilizing per node normalization.
 
@@ -30,4 +38,4 @@ Because generalization is thought by many to be closely linked to transferabilit
 of this research to find networks that are able to generalize greater by being able to solve distinct problems with the same parameter set.
 
 
-Please let me know what you think: ward.joshua92@yahoo.com
+Please let me know what you think: 
