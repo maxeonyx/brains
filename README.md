@@ -5,18 +5,15 @@ an Artificial Neural Network framework built on Tensorflow-rs bindings for creat
 
 Currently all inputs and outputs are represented as flattend 1D rust Vecs.
 
-# TODO: 
+## TODO: 
 
-add more generic typing, currently f32 for parameters and u64 for architecture size is standard.
+- [ ] Add more generic typing, currently f32 for parameters and u64 for architecture size is standard.
+- [ ] Add more layers
+- [ ] Add a form of N dimensional convolution that maps to the 1D input vectors and hidden layers 
+- [ ] formalize documentation for layers (unscaled architectures) as seen below.
 
-add more layers
-
-add a form of N dimensional convolution that maps to the 1D input vectors and hidden layers 
-
-formalize documentation for layers (unscaled architectures) as seen below.
-
-# Architectures
-## NormNet
+## Architectures
+### NormNet
 Research in Neural Networks without bias and gradient based connection dropout by utilizing per node normalization.
 
 It is hypothesized that neural networks struggle with transfer learning due to biases limiting their exploration of other local minimas.
