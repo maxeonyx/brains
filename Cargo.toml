@@ -1,5 +1,5 @@
 [package]
-name = "Brains"
+name = "brains"
 version = "0.1.2"
 authors = ["Corallus-Caninus <ward.joshua92@yahoo.com>"]
 edition = "2021"
