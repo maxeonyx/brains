@@ -14,58 +14,49 @@
 mod layers;
 mod activations;
 
+
+pub mod ops;
+pub mod dataset;
+
 use log;
-use serde::{Serialize, Deserialize};
+
 use serde_derive::{Serialize, Deserialize};
-use serde_json::{Value};
-use half::bf16;
-use half::f16;
+use tf::{TensorInfo, OutputName};
+
+
+
 use std::cell::RefCell;
-use std::env;
+
 use std::error::Error;
 use std::fs;
-use std::io::{Write, Read};
-use std::io::ErrorKind;
+use std::io::Write;
+use std::time::Instant;
 use rand::seq::IteratorRandom;
-use std::path::Path;
+
 use std::result::Result;
-use anyhow::{Context};
+use anyhow::Context;
 //TODO: clean this up with proper heirachy
 use rand::Rng;
 // include par_iter from rayon
 use rayon::iter::ParallelBridge;
 use rayon::prelude::*;
-use std::os;
-use std::rc::Rc;
-use std::time::{Duration, Instant};
+
+
 use std::collections::HashMap;
-use tensorflow::ops;
-use tensorflow::train::AdadeltaOptimizer;
-use tensorflow::train::GradientDescentOptimizer;
-use tensorflow::train::MinimizeOptions;
-use tensorflow::train::Optimizer;
-use tensorflow::BFloat16;
-use tensorflow::Code;
+use tensorflow::{
+    ops as tf_ops,
+    train::{
+        AdadeltaOptimizer,
+        MinimizeOptions,
+        Optimizer
+    },
+    self as tf,
+    Operation,
+    Output,
+    Shape,
+    Tensor,
+};
 use tensorflow::DataType;
-use tensorflow::Graph;
-use tensorflow::Operation;
-use tensorflow::Output;
-use tensorflow::OutputName;
-use tensorflow::SavedModelBundle;
-use tensorflow::SavedModelSaver;
-use tensorflow::Scope;
-use tensorflow::Session;
-use tensorflow::SessionOptions;
-use tensorflow::SessionRunArgs;
-use tensorflow::Shape;
-use tensorflow::SignatureDef;
-use tensorflow::Status;
-use tensorflow::Tensor;
-use tensorflow::TensorInfo;
-use tensorflow::Variable;
-use tensorflow::REGRESS_INPUTS;
-use tensorflow::REGRESS_METHOD_NAME;
-use tensorflow::REGRESS_OUTPUTS;
 use uuid::Uuid;
 //function types
 use layers::Layer;
@@ -75,24 +66,24 @@ use activations::Activation;
 pub struct Brain<'a> {
     //TODO: refactor with builder pattern for RL, checkpointing and feedback network once tested and working.
     /// Tensorflow objects for user abstraction from Tensorflow
-    scope: Scope,
-    session: Session,
-    session_options: SessionOptions,
+    scope: tf::Scope,
+    session: tf::Session,
+    session_options: tf::SessionOptions,
     ///each layers output for the network
     net_layers: Vec<Output>,
     ///all the trainable parameters of the network
-    net_vars: Vec<Variable>,
+    net_vars: Vec<tf::Variable>,
     ///Operations to interact with the graph (kept here for serialization)
     Input: Operation,
     Label: Operation,
     Output_op: Operation,
     Error: Operation,
     ///variables to be minimized
-    minimize_vars: Vec<Variable>,
+    minimize_vars: Vec<tf::Variable>,
     ///regression operation
     minimize: Operation,
     ///class for serializing, saving and loading the model
-    SavedModelSaver: RefCell<Option<SavedModelSaver>>,
+    SavedModelSaver: RefCell<Option<tf::SavedModelSaver>>,
     ///user specified name of this model
     name: &'a str,
     ///the highest score achieved (lowest error) as a sum of the error vector. 
@@ -127,15 +118,15 @@ impl <'a>Brain <'a>{
         activation: Activation,
         learning_rate: f32,
         error_power: f32,
-    ) -> Result<Brain<'a>, Status> {
-        let mut scope = Scope::new_root_scope();
+    ) -> Result<Brain<'a>, tf::Status> {
+        let mut scope = tf::Scope::new_root_scope();
 
         // TODO: consider inlining this since were encapsulating
-        let Input = ops::Placeholder::new()
+        let Input = tf_ops::Placeholder::new()
             .dtype(DataType::Float)
             .shape([1u64, input_size])
             .build(&mut scope.with_op_name("input"))?;
-        let Label = ops::Placeholder::new()
+        let Label = tf_ops::Placeholder::new()
             .dtype(DataType::Float)
             .shape([1u64, output_size])
             .build(&mut scope.with_op_name("label"))?;
@@ -184,14 +175,14 @@ impl <'a>Brain <'a>{
 
         let Output = output;
 
-        let options = SessionOptions::new();
+        let options = tf::SessionOptions::new();
         let SavedModelSaver= RefCell::new(None);
 
         //TODO: pass this in? this should be modular so new implementations can be tried
          let mut optimizer = AdadeltaOptimizer::new();
-         optimizer.set_learning_rate(ops::constant(learning_rate, &mut scope)?);
+         optimizer.set_learning_rate(tf_ops::constant(learning_rate, &mut scope)?);
         // let mut optimizer =
-        //     GradientDescentOptimizer::new(ops::constant(learning_rate, &mut scope)?);
+        //     GradientDescentOptimizer::new(tf_ops::constant(learning_rate, &mut scope)?);
 
         // DEFINE ERROR FUNCTION //
         //TODO: pass this in conditionally, give user output and label with
@@ -201,17 +192,17 @@ impl <'a>Brain <'a>{
         //TODO: use setters instead and have a default object behaviour.
 
         //default error is pythagorean distance
-        let Error = ops::sqrt(
-            ops::pow(
-                ops::sub(Output.clone(), Label.clone(), &mut scope)?,
-                ops::constant(2.0 as f32, &mut scope)?,
+        let Error = tf_ops::sqrt(
+            tf_ops::pow(
+                tf_ops::sub(Output.clone(), Label.clone(), &mut scope)?,
+                tf_ops::constant(2.0 as f32, &mut scope)?,
                 &mut scope,
             )?,
             &mut scope,
         )?;
-        let Error = ops::pow(
+        let Error = tf_ops::pow(
             Error.clone(),
-            ops::constant(error_power, &mut scope).unwrap(),
+            tf_ops::constant(error_power, &mut scope).unwrap(),
             &mut scope.with_op_name("error"),
         )?;
 
@@ -225,10 +216,10 @@ impl <'a>Brain <'a>{
                 MinimizeOptions::default().with_variables(&net_vars),
             )?
             .into();
-        let session = Session::new(&options, &mut scope.graph())?;
+        let session = tf::Session::new(&options, &mut scope.graph())?;
 
         // set parameters to be optimization targets if they havent been set already
-        let mut run_args = SessionRunArgs::new();
+        let mut run_args = tf::SessionRunArgs::new();
         for var in &net_vars {
             run_args.add_target(&var.initializer());
         }
@@ -364,11 +355,11 @@ impl <'a>Brain <'a>{
                 .add_collection("train", &all_vars)
                 .add_tag("serve")
                 .add_tag("train")
-                .add_signature(REGRESS_METHOD_NAME, {
-                    let mut def = SignatureDef::new(REGRESS_METHOD_NAME.to_string());
+                .add_signature(tf::REGRESS_METHOD_NAME, {
+                    let mut def = tf::SignatureDef::new(tf::REGRESS_METHOD_NAME.to_string());
                     def.add_input_info(
-                        REGRESS_INPUTS.to_string(),
-                        TensorInfo::new(
+                        tf::REGRESS_INPUTS.to_string(),
+                        tf::TensorInfo::new(
                             DataType::Float,
                             Shape::from(None),
                             OutputName {
@@ -441,13 +432,13 @@ impl <'a>Brain <'a>{
     /// previous tensorflow graph and session.
     pub fn load(&mut self, dir: String) -> Result<(), Box<dyn Error>> {
         log::debug!("loading previously saved model..");
-        let mut graph = Graph::new();
+        let mut graph = tf::Graph::new();
         //TODO: ensure we can access variables from graph or otherwise
         let bundle =
-            SavedModelBundle::load(&self.session_options, &["serve", "train"], &mut graph, dir)?;
+            tf::SavedModelBundle::load(&self.session_options, &["serve", "train"], &mut graph, dir)?;
         let signature = bundle
             .meta_graph_def()
-            .get_signature(REGRESS_METHOD_NAME)?
+            .get_signature(tf::REGRESS_METHOD_NAME)?
             .clone();
 
         self.session = bundle.session;
@@ -529,7 +520,7 @@ impl <'a>Brain <'a>{
                 label_tensor[i] = label[i].clone();
             }
 
-            let mut run_args = SessionRunArgs::new();
+            let mut run_args = tf::SessionRunArgs::new();
             run_args.add_target(&self.minimize);
 
             let error_squared_fetch = run_args.request_fetch(&self.Error, 0);
@@ -619,7 +610,7 @@ impl <'a>Brain <'a>{
                 label_tensor[i] = label[i].clone();
             }
 
-            let mut run_args = SessionRunArgs::new();
+            let mut run_args = tf::SessionRunArgs::new();
             run_args.add_target(&self.minimize);
 
             let error_squared_fetch = run_args.request_fetch(&self.Error, 0);
@@ -733,7 +724,7 @@ impl <'a>Brain <'a>{
     }
     /// forward pass and return the output of the network.
     pub fn infer<T: tensorflow::TensorType>(&self, inputs: Tensor<T>)-> Result<Tensor<T>, Box<dyn Error>>{
-        let mut run_args = SessionRunArgs::new();
+        let mut run_args = tf::SessionRunArgs::new();
         let output = run_args.request_fetch(&self.Output_op, 0);
         run_args.add_feed(&self.Input, 0, &inputs);
 
@@ -745,7 +736,7 @@ impl <'a>Brain <'a>{
 
     /// Online reinforcement learning method.
     /// 
-    /// Takes the given inputs and fitness function and backprops the network once, 
+    /// Takes the given inputs and fitness function and backprtf_ops the network once, 
     /// returning the output output vector. 
     /// This should be called as an online (realtime) reinforcment learning technique 
     /// where labels can be formed given a fitness function.
@@ -776,7 +767,7 @@ impl <'a>Brain <'a>{
         let reward= fitness_function(&outputs);
 
         //backprop
-        let mut run_args = SessionRunArgs::new();
+        let mut run_args = tf::SessionRunArgs::new();
         run_args.add_target(&self.minimize);
 
         //TODO: sparse reward (variable episodic automation) buffering goes here if implemented
